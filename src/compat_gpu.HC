@@ -76,11 +76,21 @@ class SDL_MouseButtonEvent {
   I32 y;
 };
 
+class SDL_WindowEvent {
+  U32 type;
+  U32 timestamp;
+  U32 windowID;
+  U8  event;
+  I32 data1;
+  I32 data2;
+};
+
 union SDL_Event {
   U32                  type;
   SDL_KeyboardEvent    key;
   SDL_MouseMotionEvent motion;
   SDL_MouseButtonEvent button;
+  SDL_WindowEvent      window;
   U8                   padding[64];
 };
 
@@ -91,6 +101,22 @@ union SDL_Event {
 #define SDL_RENDERER_SOFTWARE       0x00000001
 #define SDL_PIXELFORMAT_ARGB8888    0x16362004
 #define SDL_TEXTUREACCESS_STREAMING 1
+
+#define SDL_WINDOWEVENT             0x108
+#define SDL_WINDOWEVENT_NONE        0
+#define SDL_WINDOWEVENT_SHOWN       1
+#define SDL_WINDOWEVENT_HIDDEN      2
+#define SDL_WINDOWEVENT_EXPOSED     3
+#define SDL_WINDOWEVENT_MOVED       4
+#define SDL_WINDOWEVENT_RESIZED     5
+#define SDL_WINDOWEVENT_SIZE_CHANGED 6
+#define SDL_WINDOWEVENT_MINIMIZED   7
+#define SDL_WINDOWEVENT_MAXIMIZED   8
+#define SDL_WINDOWEVENT_RESTORED    9
+#define SDL_WINDOW_ENTER            10
+#define SDL_WINDOW_LEAVE            11
+#define SDL_WINDOW_FOCUS_GAINED     12
+#define SDL_WINDOW_FOCUS_LOST       13
 
 #define SDL_QUIT            0x100
 #define SDL_KEYDOWN         0x300
@@ -362,6 +388,15 @@ U0 HCC_PumpEvents()
         ms.pos.y = ev.button.y;
         if (ev.button.button == SDL_BUTTON_LEFT)  ms.lb = FALSE;
         if (ev.button.button == SDL_BUTTON_RIGHT) ms.rb = FALSE;
+        break;
+      case SDL_WINDOWEVENT:
+        if (ev.window.event == SDL_WINDOW_FOCUS_GAINED ||
+            ev.window.event == SDL_WINDOW_ENTER) {
+          // Re-enable relative mouse mode if it was disabled on focus loss
+          SDL_SetRelativeMouseMode(SDL_TRUE);
+          SDL_ShowCursor(SDL_FALSE);
+          _hcc_relative_mouse = 1;
+        }
         break;
     }
   }
