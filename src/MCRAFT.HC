@@ -101,7 +101,11 @@
 #define Bool I64
 #endif
 
+#ifdef __HCC__
 #include "compat_hcc.HC"
+#else
+#define SET_WIN_INHIBIT(x) Fs->win_inhibit = (x)
+#endif
 
 
 

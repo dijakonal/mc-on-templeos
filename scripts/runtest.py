@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot the current HolyCraft ISO in headless QEMU and take a screenshot.
 
-Usage: python3 runtest.py TAG [DELAY_SECONDS]
+Usage: python3 scripts/runtest.py TAG [DELAY_SECONDS]
 QEMU's monitor is exposed on /tmp/opencode/qmon.sock so qctl.py can send
 input and take more screenshots afterwards.
 """
@@ -13,8 +13,9 @@ import time
 import qctl
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(BASE)
 ISO = os.environ.get('HOLYCRAFT_ISO',
-                     os.path.join(BASE, 'TempleOS-HolyCraft.ISO'))
+                     os.path.join(ROOT, 'TempleOS-HolyCraft.ISO'))
 VGA = os.environ.get('HOLYCRAFT_VGA', 'std')
 SOCK = '/tmp/opencode/qmon.sock'
 SHOT_DIR = '/tmp/opencode/'

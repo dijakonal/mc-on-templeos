@@ -10,8 +10,9 @@ import os
 import random
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(BASE, 'MCRAFT.HC')
-DST = os.path.join(BASE, 'MCRAFT_GPU.HC')
+ROOT = os.path.dirname(BASE)
+SRC = os.path.join(ROOT, 'src', 'MCRAFT.HC')
+DST = os.path.join(ROOT, 'src', 'MCRAFT_GPU.HC')
 
 FONT = {
     ' ': ["00000"] * 7,

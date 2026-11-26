@@ -7,11 +7,11 @@ supervisor to recompile it.  HUD state is read back from a screenshot with the
 exact-glyph OCR in glyph_ocr.py.
 
 Usage:
-  python3 devbridge.py boot          boot the dev VM (first time)
-  python3 devbridge.py reload        copy MCRAFT.HC + trigger a hot reload
-  python3 devbridge.py shot [NAME]   screenshot + HUD report
-  python3 devbridge.py key KEYS      send a key sequence (qctl.py syntax)
-  python3 devbridge.py stop          stop the VM
+  python3 scripts/devbridge.py boot          boot the dev VM (first time)
+  python3 scripts/devbridge.py reload        copy MCRAFT.HC + trigger a hot reload
+  python3 scripts/devbridge.py shot [NAME]   screenshot + HUD report
+  python3 scripts/devbridge.py key KEYS      send a key sequence (qctl.py syntax)
+  python3 scripts/devbridge.py stop          stop the VM
 """
 import os
 import subprocess
@@ -19,8 +19,9 @@ import sys
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-ISO = os.path.join(BASE, 'TempleOS-HolyCraft-DEV.ISO')
-DISK = os.path.join(BASE, 'fat.img')
+ROOT = os.path.dirname(BASE)
+ISO = os.path.join(ROOT, 'TempleOS-HolyCraft-DEV.ISO')
+DISK = os.path.join(ROOT, 'fat.img')
 SOCK = '/tmp/opencode/qdev.sock'
 PART_OFFSET = 2048 * 512
 SHOTS = '/tmp/opencode/'
@@ -52,7 +53,7 @@ def mdel(dest):
 
 def dev_source():
     """Return source with the dev-only hot-reload hook injected."""
-    src = open(os.path.join(BASE, 'MCRAFT.HC')).read()
+    src = open(os.path.join(ROOT, 'src', 'MCRAFT.HC')).read()
     if HOOK_OLD not in src:
         raise RuntimeError('dev hook anchor not found in MCRAFT.HC')
     return src.replace(HOOK_OLD, HOOK_NEW, 1)
@@ -89,7 +90,7 @@ def boot(delay=45):
 def connect():
     qctl.SOCK = SOCK
     if not os.path.exists(SOCK):
-        raise RuntimeError('dev VM is not running; use: devbridge.py boot')
+        raise RuntimeError('dev VM is not running; use: scripts/devbridge.py boot')
 
 
 def shot(name='devshot'):
