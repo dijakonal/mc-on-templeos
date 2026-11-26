@@ -145,6 +145,29 @@ union SDL_Event {
 #define SDLK_DOWN         0x40000051
 #define SDLK_UP           0x40000052
 
+#define SDL_TRUE 1
+#define SDL_FALSE 0
+
+#define SDLK_ESCAPE       27
+#define SDLK_SPACE        ' '
+#define SDLK_1            '1'
+#define SDLK_2            '2'
+#define SDLK_3            '3'
+#define SDLK_4            '4'
+#define SDLK_5            '5'
+#define SDLK_6            '6'
+#define SDLK_a            'a'
+#define SDLK_d            'd'
+#define SDLK_f            'f'
+#define SDLK_s            's'
+#define SDLK_w            'w'
+#define SDLK_LSHIFT       0x400000E1
+#define SDLK_RSHIFT       0x400000E5
+#define SDLK_RIGHT        0x4000004F
+#define SDLK_LEFT         0x40000050
+#define SDLK_DOWN         0x40000051
+#define SDLK_UP           0x40000052
+
 extern I32  SDL_Init(U32 flags);
 extern U0   SDL_Quit();
 extern U8  *SDL_GetError();
@@ -386,10 +409,14 @@ U0 HCC_Present()
     HCC_PresentRGB32(gpu_back, w, h, s);
     return;
   }
+  // Use texture-based 32-bit presentation instead of software palette
+  // Convert 16-color framebuffer to 32-bit ARGB8888 for texture
   I64 x, y;
   for (y = 0; y < HCC_FB_H; y++) {
     for (x = 0; x < HCC_FB_W; x++) {
-      _hcc_rgb[y * HCC_FB_W + x] = 0xFF000000 | _hcc_pal[_hcc_fb[y * HCC_FB_W + x] & 15];
+      // Expand 4-bit palette index to 8-bit RGB using the palette, with full alpha
+      U8 pal_idx = _hcc_fb[y * HCC_FB_W + x] & 15;
+      _hcc_rgb[y * HCC_FB_W + x] = 0xFF000000 | _hcc_pal[pal_idx];
     }
   }
   HCC_PresentRGB32(_hcc_rgb, HCC_FB_W, HCC_FB_H, HCC_FB_W);
