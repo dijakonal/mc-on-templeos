@@ -13,7 +13,9 @@ import time
 import qctl
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-ISO = os.path.join(BASE, 'TempleOS-HolyCraft.ISO')
+ISO = os.environ.get('HOLYCRAFT_ISO',
+                     os.path.join(BASE, 'TempleOS-HolyCraft.ISO'))
+VGA = os.environ.get('HOLYCRAFT_VGA', 'std')
 SOCK = '/tmp/opencode/qmon.sock'
 SHOT_DIR = '/tmp/opencode/'
 
@@ -32,7 +34,7 @@ def boot(tag, delay=85):
     kill()
     proc = subprocess.Popen([
         'qemu-system-x86_64', '-m', '512', '-cdrom', ISO, '-boot', 'd',
-        '-vga', 'std', '-display', 'none',
+        '-vga', VGA, '-display', 'none',
         '-monitor', 'unix:' + SOCK + ',server,nowait',
         '-accel', 'tcg,thread=multi'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

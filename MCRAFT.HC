@@ -42,11 +42,14 @@
 #define MC_FOG_END      (MC_RENDER_DIST * 0.95)
 #define MC_FOCAL        450.0           // projection focal length in pixels
 
-#define MC_GRAVITY      26.0
-#define MC_JUMP_VEL     8.2
-#define MC_WALK_SPEED   4.3
+#define MC_GRAVITY      32.0            // Java Edition: -0.08 blocks/tick^2
+#define MC_JUMP_VEL     8.4             // Java Edition: 0.42 blocks/tick
+#define MC_WALK_SPEED   4.3             // Java Edition walking speed
+#define MC_SPRINT_SPEED 5.6             // Java Edition sprint speed
 #define MC_FLY_SPEED    9.0
 #define MC_SWIM_SPEED   2.6
+#define MC_TERMINAL_VY  48.0
+#define MC_STEP_TIME    (1.0 / 30.0)    // physics substep, decoupled from FPS
 #define MC_HALF         0.30            // player half-width
 #define MC_HEIGHT       1.80            // player height
 #define MC_EYE          1.62            // eye height above feet
@@ -64,7 +67,10 @@
 #define B_LEAVES        7
 #define B_SNOW          8
 #define B_BEDROCK       9
-#define B_COUNT         10
+#define B_GRAVEL        10
+#define B_COAL_ORE      11
+#define B_IRON_ORE      12
+#define B_COUNT         13
 
 // ---- face dirs ----
 #define D_POSX  0
@@ -133,6 +139,84 @@ I64 Hash2i(I64 x, I64 z)
 F64 Hash2f(I64 x, I64 z)
 {
   return (Hash2i(x, z) & 0xFFFF) / 65535.0;
+}
+
+I64 Hash3i(I64 x, I64 y, I64 z)
+{
+  I64 h = Hash2i(x + y * 101, z - y * 71) + y * 2246822519;
+  h = (h ^ (h >> 13)) * 3266489917;
+  return h ^ (h >> 16);
+}
+
+F64 FFabs(F64 v) { if (v < 0.0) return -v; return v; }
+F64 FLerp(F64 a, F64 b, F64 t) { return a + (b - a) * t; }
+
+F64 Fade5(F64 t)
+{
+  return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+F64 Grad2Dot(I64 h, F64 dx, F64 dz)
+{
+  I64 g = h & 7;
+  if (g == 0) return ( dx + dz) * 0.7071;
+  if (g == 1) return (-dx + dz) * 0.7071;
+  if (g == 2) return ( dx - dz) * 0.7071;
+  if (g == 3) return (-dx - dz) * 0.7071;
+  if (g == 4) return  dx;
+  if (g == 5) return -dx;
+  if (g == 6) return  dz;
+  return -dz;
+}
+
+// 2D gradient noise, roughly in [-1,1].  Unlike value noise, the zeros
+// between gradient points give us ridges, river valleys and real coastlines.
+F64 GNoise2(F64 x, F64 z)
+{
+  I64 x0 = ToI64(Floor(x)), z0 = ToI64(Floor(z));
+  F64 xf = x - x0, zf = z - z0;
+  F64 u = Fade5(xf), v = Fade5(zf);
+  F64 d00 = Grad2Dot(Hash2i(x0,     z0),     xf,         zf);
+  F64 d10 = Grad2Dot(Hash2i(x0 + 1, z0),     xf - 1.0,   zf);
+  F64 d01 = Grad2Dot(Hash2i(x0,     z0 + 1), xf,         zf - 1.0);
+  F64 d11 = Grad2Dot(Hash2i(x0 + 1, z0 + 1), xf - 1.0,   zf - 1.0);
+  return FLerp(FLerp(d00, d10, u), FLerp(d01, d11, u), v) * 1.4;
+}
+
+F64 Fbm2(F64 x, F64 z, I64 oct)
+{
+  F64 s = 0, amp = 1, f = 1, norm = 0;
+  I64 i;
+  for (i = 0; i < oct; i++) {
+    s += amp * GNoise2(x * f, z * f);
+    norm += amp;
+    amp *= 0.5;
+    f *= 2.0;
+  }
+  return s / norm;                       // roughly [-1,1]
+}
+
+F64 NFbm2(F64 x, F64 z, I64 oct)
+{
+  return 0.5 + 0.5 * Fbm2(x, z, oct);    // [0,1]
+}
+
+F64 VNoise3(F64 x, F64 y, F64 z)
+{
+  I64 x0 = ToI64(Floor(x)), y0 = ToI64(Floor(y)), z0 = ToI64(Floor(z));
+  F64 xf = x - x0, yf = y - y0, zf = z - z0;
+  F64 u = Fade5(xf), v = Fade5(yf), w = Fade5(zf);
+  F64 c000 = (Hash3i(x0, y0, z0) & 0xFFFF) / 65535.0;
+  F64 c100 = (Hash3i(x0 + 1, y0, z0) & 0xFFFF) / 65535.0;
+  F64 c010 = (Hash3i(x0, y0 + 1, z0) & 0xFFFF) / 65535.0;
+  F64 c110 = (Hash3i(x0 + 1, y0 + 1, z0) & 0xFFFF) / 65535.0;
+  F64 c001 = (Hash3i(x0, y0, z0 + 1) & 0xFFFF) / 65535.0;
+  F64 c101 = (Hash3i(x0 + 1, y0, z0 + 1) & 0xFFFF) / 65535.0;
+  F64 c011 = (Hash3i(x0, y0 + 1, z0 + 1) & 0xFFFF) / 65535.0;
+  F64 c111 = (Hash3i(x0 + 1, y0 + 1, z0 + 1) & 0xFFFF) / 65535.0;
+  F64 x00 = FLerp(c000, c100, u), x10 = FLerp(c010, c110, u);
+  F64 x01 = FLerp(c001, c101, u), x11 = FLerp(c011, c111, u);
+  return FLerp(FLerp(x00, x10, v), FLerp(x01, x11, v), w);
 }
 
 // ---- world access ----
@@ -238,6 +322,24 @@ U0 InitBlocks()
   blkinfo[B_BEDROCK].bot_a  = DKGRAY; blkinfo[B_BEDROCK].bot_b  = BLACK;
   blkinfo[B_BEDROCK].solid = TRUE;   blkinfo[B_BEDROCK].targetable = FALSE;
 
+  blkinfo[B_GRAVEL].name = "Gravel";
+  blkinfo[B_GRAVEL].top_a  = LTGRAY; blkinfo[B_GRAVEL].top_b  = DKGRAY;
+  blkinfo[B_GRAVEL].side_a = DKGRAY; blkinfo[B_GRAVEL].side_b = LTGRAY;
+  blkinfo[B_GRAVEL].bot_a  = DKGRAY; blkinfo[B_GRAVEL].bot_b  = BLACK;
+  blkinfo[B_GRAVEL].solid = TRUE;    blkinfo[B_GRAVEL].targetable = TRUE;
+
+  blkinfo[B_COAL_ORE].name = "Coal Ore";
+  blkinfo[B_COAL_ORE].top_a  = DKGRAY; blkinfo[B_COAL_ORE].top_b  = BLACK;
+  blkinfo[B_COAL_ORE].side_a = LTGRAY; blkinfo[B_COAL_ORE].side_b = BLACK;
+  blkinfo[B_COAL_ORE].bot_a  = DKGRAY; blkinfo[B_COAL_ORE].bot_b  = BLACK;
+  blkinfo[B_COAL_ORE].solid = TRUE;    blkinfo[B_COAL_ORE].targetable = TRUE;
+
+  blkinfo[B_IRON_ORE].name = "Iron Ore";
+  blkinfo[B_IRON_ORE].top_a  = YELLOW; blkinfo[B_IRON_ORE].top_b  = BROWN;
+  blkinfo[B_IRON_ORE].side_a = LTRED;  blkinfo[B_IRON_ORE].side_b = BROWN;
+  blkinfo[B_IRON_ORE].bot_a  = BROWN;  blkinfo[B_IRON_ORE].bot_b  = DKGRAY;
+  blkinfo[B_IRON_ORE].solid = TRUE;    blkinfo[B_IRON_ORE].targetable = TRUE;
+
   hotbar_items[0] = B_GRASS;
   hotbar_items[1] = B_DIRT;
   hotbar_items[2] = B_STONE;
@@ -248,33 +350,6 @@ U0 InitBlocks()
 }
 
 // =============================== TERRAIN =================================
-
-// 2D value noise + fBm, hashed so the world is the same every run.
-F64 VNoise(F64 x, F64 z)
-{
-  I64 x0 = ToI64(Floor(x)), z0 = ToI64(Floor(z));
-  F64 xf = x - x0, zf = z - z0;
-  F64 u = xf * xf * (3.0 - 2.0 * xf);
-  F64 v = zf * zf * (3.0 - 2.0 * zf);
-  F64 a = Hash2f(x0,     z0);
-  F64 b = Hash2f(x0 + 1, z0);
-  F64 c = Hash2f(x0,     z0 + 1);
-  F64 d = Hash2f(x0 + 1, z0 + 1);
-  return (a * (1.0 - u) + b * u) * (1.0 - v) + (c * (1.0 - u) + d * u) * v;
-}
-
-F64 Fbm(F64 x, F64 z)
-{
-  F64 s = 0, amp = 1, f = 1, norm = 0;
-  I64 i;
-  for (i = 0; i < 4; i++) {
-    s += amp * VNoise(x * f, z * f);
-    norm += amp;
-    amp *= 0.5;
-    f *= 2.0;
-  }
-  return s / norm;
-}
 
 U0 PlantTree(I64 x, I64 y, I64 z, I64 th)
 {
@@ -296,45 +371,111 @@ U0 PlantTree(I64 x, I64 y, I64 z, I64 th)
   }
 }
 
+// Sparse 3D-noise caverns.  Below sea level they fill with water instead of air.
+U0 CarveCaves()
+{
+  I64 x, z, y, h, b;
+  F64 c, d;
+  for (x = 1; x < MC_WORLD_SX - 1; x++)
+    for (z = 1; z < MC_WORLD_SZ - 1; z++) {
+      h = colmax[x + z * MC_WORLD_SX] - 1;
+      for (y = 2; y < h - 1; y++) {
+        c = VNoise3(x * 0.11 + 13.0, y * 0.11 + 29.0, z * 0.11 - 7.0);
+        if (c > 0.75) {
+          d = VNoise3(x * 0.05 - 41.0, y * 0.05 + 17.0, z * 0.05 + 63.0);
+          if (d > 0.52) {
+            b = GetBlock(x, y, z);
+            if (b == B_STONE || b == B_DIRT || b == B_SAND || b == B_GRAVEL ||
+                b == B_COAL_ORE || b == B_IRON_ORE) {
+              if (y <= MC_SEA) SetBlockRaw(x, y, z, B_WATER);
+              else             SetBlockRaw(x, y, z, B_AIR);
+            }
+          }
+        }
+      }
+    }
+}
+
+// Tree density follows humidity/temperature instead of a flat random chance.
+U0 DecorateForest()
+{
+  I64 x, z, h, th, nh, dx, dz, steep, hsh, b;
+  F64 temp, humid;
+  for (x = 2; x < MC_WORLD_SX - 2; x++)
+    for (z = 2; z < MC_WORLD_SZ - 2; z++) {
+      h = colmax[x + z * MC_WORLD_SX] - 1;
+      b = GetBlock(x, h, z);
+      if (b != B_GRASS && b != B_SNOW) {
+        // land-only; no trees on sand, gravel or in water
+      } else {
+        temp  = NFbm2(x * 0.014 + 211.0, z * 0.014 - 77.0, 2);
+        humid = NFbm2(x * 0.017 - 133.0, z * 0.017 + 59.0, 2);
+        steep = FALSE;
+        for (dx = -1; dx <= 1; dx++)
+          for (dz = -1; dz <= 1; dz++) {
+            nh = colmax[(x + dx) + (z + dz) * MC_WORLD_SX] - 1;
+            if (IAbs(nh - h) > 1) steep = TRUE;
+          }
+        if (!steep) {
+          hsh = Hash2i(x, z);
+          th = 4 + (hsh & 3);
+          if (b == B_GRASS && humid > 0.45 && temp > 0.22 && temp < 0.78 && (hsh & 63) == 0) {
+            if (h + th + 2 < MC_WORLD_SY) PlantTree(x, h + 1, z, th);
+          } else if (b == B_SNOW && humid > 0.55 && temp < 0.32 && (hsh & 127) == 0) {
+            if (h + th + 2 < MC_WORLD_SY) PlantTree(x, h + 1, z, th);
+          }
+        }
+      }
+    }
+}
+
 U0 GenWorld()
 {
-  I64 x, z, y, h, th;
-  F64 n1, n2;
+  I64 x, z, y, h, top, surface, under, depth, b;
+  F64 wx, wz, cont, er, ridge, riv, temp, humid, detail, mount;
   for (x = 0; x < MC_WORLD_SX; x++)
     for (z = 0; z < MC_WORLD_SZ; z++) {
-      n1 = Fbm(x * 0.030,           z * 0.030);
-      n2 = Fbm(x * 0.008 + 41.3,    z * 0.008 + 87.9);
-      h  = 3 + n1 * 22 + n2 * 15;
-      h  = IClamp(h, 1, MC_WORLD_SY - 10);
+      // Domain warp stops the coastlines from looking like grid-aligned blobs.
+      wx = x + 9.0 * GNoise2(x * 0.011 + 5.0,  z * 0.011 - 9.0);
+      wz = z + 9.0 * GNoise2(x * 0.011 - 17.0, z * 0.011 + 31.0);
+      cont  = NFbm2(wx * 0.0125, wz * 0.0125, 3);
+      er    = NFbm2(wx * 0.043 + 19.0, wz * 0.043 - 7.0, 2);
+      ridge = 1.0 - FFabs(Fbm2(wx * 0.026 - 33.0, wz * 0.026 + 41.0, 3));
+      riv   = FClamp((0.085 - FFabs(GNoise2(wx * 0.021 + 120.0,
+                                            wz * 0.021 - 61.0))) / 0.085, 0.0, 1.0);
+      temp  = NFbm2(x * 0.014 + 211.0, z * 0.014 - 77.0, 2);
+      humid = NFbm2(x * 0.017 - 133.0, z * 0.017 + 59.0, 2);
+      detail = Fbm2(wx * 0.085, wz * 0.085, 3) * 3.5;
+      mount = FClamp((cont - 0.54) / 0.36, 0.0, 1.0);
+      mount = mount * mount;
+      h = ToI64(Floor(3.0 + cont * 22.0 + detail
+                     + mount * (4.0 + ridge * 10.0)
+                     - (1.0 - cont) * er * 3.0 - riv * 4.5));
+      h = IClamp(h, 1, MC_WORLD_SY - 8);
+      if (h <= MC_SEA - 2)      surface = B_GRAVEL;
+      else if (h <= MC_SEA + 1) surface = B_SAND;
+      else if (temp > 0.68 && humid < 0.40) surface = B_SAND;
+      else if (h >= 25 - temp * 7.0) surface = B_SNOW;
+      else                          surface = B_GRASS;
+      if (surface == B_SNOW)    under = B_DIRT;
+      else if (surface == B_SAND || h <= MC_SEA + 1) under = B_SAND;
+      else                      under = B_DIRT;
+      depth = 3 + (Hash2i(x, z) & 1);
       for (y = 0; y <= h; y++) {
-        if (y == 0)
-          SetBlockRaw(x, y, z, B_BEDROCK);
-        else if (y == h) {
-          if (h <= MC_SEA + 1) SetBlockRaw(x, y, z, B_SAND);
-          else if (h >= 26)    SetBlockRaw(x, y, z, B_SNOW);
-          else                 SetBlockRaw(x, y, z, B_GRASS);
-        } else if (y >= h - 3) {
-          if (h <= MC_SEA + 1) SetBlockRaw(x, y, z, B_SAND);
-          else                 SetBlockRaw(x, y, z, B_DIRT);
-        }
-        else
-          SetBlockRaw(x, y, z, B_STONE);
+        if (y == 0)             b = B_BEDROCK;
+        else if (y == h)        b = surface;
+        else if (y >= h - depth) b = under;
+        else if (y > 1 && (Hash3i(x, y, z) & 1023) == 0) b = B_COAL_ORE;
+        else if (y > 1 && y < 22 && (Hash3i(x + 17, y * 3, z - 9) & 2047) == 0) b = B_IRON_ORE;
+        else                    b = B_STONE;
+        SetBlockRaw(x, y, z, b);
       }
       for (y = h + 1; y <= MC_SEA; y++)
         SetBlockRaw(x, y, z, B_WATER);
       RecalcCol(x, z);
     }
-  for (x = 2; x < MC_WORLD_SX - 2; x++)
-    for (z = 2; z < MC_WORLD_SZ - 2; z++) {
-      if ((Hash2i(x, z) & 63) == 0) {
-        h = colmax[x + z * MC_WORLD_SX] - 1;
-        if (GetBlock(x, h, z) == B_GRASS) {
-          th = 4 + (Hash2i(x + 7, z + 3) & 1);
-          if (h + th + 2 < MC_WORLD_SY)
-            PlantTree(x, h + 1, z, th);
-        }
-      }
-    }
+  CarveCaves;
+  DecorateForest;
 }
 
 Bool SpawnOK(I64 x, I64 z, I64 *h_out)
@@ -345,6 +486,8 @@ Bool SpawnOK(I64 x, I64 z, I64 *h_out)
   h = MC_WORLD_SY - 1;
   while (h >= 0 && world[WIdx(x, h, z)] == B_AIR) h--;
   if (h < MC_SEA + 2 || h > MC_WORLD_SY - 8) return FALSE;
+  b = world[WIdx(x, h, z)];
+  if (b != B_GRASS && b != B_SNOW) return FALSE;      // not beach/desert
   for (y = h + 1; y <= h + 12; y++)
     for (dx = -2; dx <= 2; dx++)
       for (dz = -2; dz <= 2; dz++) {
@@ -359,7 +502,7 @@ U0 SpawnPlayer()
 {
   I64 cx = MC_WORLD_SX / 2, cz = MC_WORLD_SZ / 2;
   I64 h = MC_SEA + 1, r, dx, dz, sx = cx, sz = cz, found = FALSE;
-  for (r = 0; r <= 14 && !found; r++)
+  for (r = 0; r <= 24 && !found; r++)
     for (dx = -r; dx <= r && !found; dx++)
       for (dz = -r; dz <= r && !found; dz++)
         if (IAbs(dx) == r || IAbs(dz) == r)
@@ -368,60 +511,64 @@ U0 SpawnPlayer()
           }
   P.x = sx + 0.5;  P.y = h + 1.01;  P.z = sz + 0.5;
   P.vx = P.vy = P.vz = 0;
-  P.yaw = 0.8;  P.pitch = -0.55;
+  P.yaw = 4.5;  P.pitch = -0.10;
   P.on_ground = FALSE;
   P.flying = FALSE;
 }
 
 // =============================== PHYSICS =================================
 
-// Move along one axis and push out of any solid blocks we overlap.
+// Move along one axis, clamping to the nearest blocking cell.  Axis-by-axis
+// resolution plus a small skin avoids corner snagging and wall tunneling.
 U0 MoveAxis(I64 axis, F64 delta)
 {
-  F64 x0, x1, y0, y1, z0, z1, cx, cy, cz, peps = 0.001;
+  F64 pips = 0.001, x0, x1, y0, y1, z0, z1, best, cand;
   I64 ix, iy, iz, hit;
-  I64 gx0, gx1, gy0, gy1, gz0, gz1;
   if (axis == 0) P.x += delta;
-  if (axis == 1) P.y += delta;
-  if (axis == 2) P.z += delta;
-  x0 = P.x - MC_HALF; x1 = P.x + MC_HALF;
-  y0 = P.y + peps;     y1 = P.y + MC_HEIGHT;
-  z0 = P.z - MC_HALF; z1 = P.z + MC_HALF;
+  else if (axis == 1) P.y += delta;
+  else P.z += delta;
+  x0 = P.x - MC_HALF + pips; x1 = P.x + MC_HALF - pips;
+  y0 = P.y + pips;           y1 = P.y + MC_HEIGHT - pips;
+  z0 = P.z - MC_HALF + pips; z1 = P.z + MC_HALF - pips;
+  best = P.x;
+  if (axis == 1) best = P.y;
+  if (axis == 2) best = P.z;
   hit = FALSE;
-  for (ix = ToI64(Floor(x0)); ix <= Floor(x1); ix++)
-    for (iy = ToI64(Floor(y0)); iy <= Floor(y1); iy++)
-      for (iz = ToI64(Floor(z0)); iz <= Floor(z1); iz++) {
+  for (ix = ToI64(Floor(x0)); ix <= ToI64(Floor(x1)); ix++)
+    for (iy = ToI64(Floor(y0)); iy <= ToI64(Floor(y1)); iy++)
+      for (iz = ToI64(Floor(z0)); iz <= ToI64(Floor(z1)); iz++)
         if (IsSolid(ix, iy, iz)) {
           hit = TRUE;
-        if (axis == 0) {
-          if (delta > 0) P.x = ix - MC_HALF - peps;
-          else           P.x = ix + 1 + MC_HALF + peps;
-          P.vx = 0;
+          if (axis == 0) {
+            cand = ix - MC_HALF - pips;
+            if (delta > 0) { if (cand < best) best = cand; }
+            else           { cand = ix + 1 + MC_HALF + pips; if (cand > best) best = cand; }
+          }
+          if (axis == 1) {
+            cand = iy - MC_HEIGHT - pips;
+            if (delta > 0) { if (cand < best) best = cand; }
+            else           { cand = iy + 1.0 + pips; if (cand > best) best = cand; }
+          }
+          if (axis == 2) {
+            cand = iz - MC_HALF - pips;
+            if (delta > 0) { if (cand < best) best = cand; }
+            else           { cand = iz + 1 + MC_HALF + pips; if (cand > best) best = cand; }
+          }
         }
-        if (axis == 1) {
-          if (delta > 0) { P.y = iy - MC_HEIGHT - peps; P.vy = 0; }
-          else           { P.y = iy + 1.0 + peps;       P.vy = 0;
-                           P.on_ground = TRUE; }
-        }
-        if (axis == 2) {
-          if (delta > 0) P.z = iz - MC_HALF - peps;
-          else           P.z = iz + 1 + MC_HALF + peps;
-          P.vz = 0;
-        }
-          x0 = P.x - MC_HALF; x1 = P.x + MC_HALF;
-          y0 = P.y + peps;     y1 = P.y + MC_HEIGHT;
-          z0 = P.z - MC_HALF; z1 = P.z + MC_HALF;
-        }
-      }
-  if (hit && axis == 0) P.vx = 0;
-  if (hit && axis == 2) P.vz = 0;
+  if (!hit) return;
+  if (axis == 0) { P.x = best; P.vx = 0; }
+  if (axis == 1) {
+    P.y = best;  P.vy = 0;
+    if (delta < 0) P.on_ground = TRUE;
+  }
+  if (axis == 2) { P.z = best; P.vz = 0; }
 }
 
 U0 UpdatePlayer(F64 dt)
 {
-  F64 fwd_x, fwd_z, rgt_x, rgt_z, mx, mz, spd, k;
+  F64 fwd_x, fwd_z, rgt_x, rgt_z, mx, mz, spd, k, accel;
   I64 wbx, wby, wbz;
-  Bool in_water;
+  Bool in_water, sprint;
   mx = 0; mz = 0;
   fwd_x = Sin(P.yaw);  fwd_z = Cos(P.yaw);
   rgt_x = Cos(P.yaw);  rgt_z = -Sin(P.yaw);
@@ -430,30 +577,46 @@ U0 UpdatePlayer(F64 dt)
   if (Bt(kbd.down_bitmap, MC_SC_D)) { mx += rgt_x; mz += rgt_z; }
   if (Bt(kbd.down_bitmap, MC_SC_A)) { mx -= rgt_x; mz -= rgt_z; }
   wbx = P.x; wby = P.y + 0.4; wbz = P.z;
-  in_water = GetBlock(wbx, wby, wbz) == B_WATER;
+  in_water = GetBlock(wbx, wby, wbz) == B_WATER ||
+             GetBlock(P.x, P.y + MC_EYE, P.z) == B_WATER;
+  sprint = Bt(kbd.down_bitmap, SC_SHIFT) && !P.flying && !in_water;
   if (P.flying) spd = MC_FLY_SPEED;
+  else if (sprint) spd = MC_SPRINT_SPEED;
   else if (in_water) spd = MC_SWIM_SPEED;
   else spd = MC_WALK_SPEED;
   if (mx != 0.0 || mz != 0.0) {
     k = 1.0 / Sqrt(mx * mx + mz * mz);
     mx *= k * spd;  mz *= k * spd;
   }
-  // accelerate toward the desired velocity
-  k = FClamp(10.0 * dt, 0.0, 1.0);
+  // Ground accel is higher than air accel, as in Java Edition.
+  if (in_water) accel = 5.0;
+  else if (P.on_ground) accel = 14.0;
+  else accel = 3.0;
+  k = FClamp(accel * dt, 0.0, 1.0);
   P.vx += (mx - P.vx) * k;
   P.vz += (mz - P.vz) * k;
+  if (mx == 0.0 && mz == 0.0) {
+    if (in_water) accel = 4.0;
+    else if (P.on_ground) accel = 10.0;
+    else accel = 0.5;
+    k = FClamp(accel * dt, 0.0, 1.0);
+    P.vx -= P.vx * k;
+    P.vz -= P.vz * k;
+  }
   if (P.flying) {
     P.vy = 0;
     if (Bt(kbd.down_bitmap, MC_SC_SPACE)) P.vy =  MC_FLY_SPEED * 0.8;
     if (Bt(kbd.down_bitmap, SC_SHIFT))    P.vy = -MC_FLY_SPEED * 0.8;
   } else {
     if (in_water) {
-      P.vy -= 6.0 * dt;
-      if (P.vy < -2.0) P.vy = -2.0;
+      P.vy -= 8.0 * dt;                  // slight sink
+      if (P.vy < -1.6) P.vy = -1.6;
+      k = FClamp(6.0 * dt, 0.0, 1.0);
+      P.vy -= P.vy * k;                  // water drag
       if (Bt(kbd.down_bitmap, MC_SC_SPACE)) P.vy = MC_SWIM_SPEED;
     } else {
       P.vy -= MC_GRAVITY * dt;
-      if (P.vy < -40.0) P.vy = -40.0;
+      if (P.vy < -MC_TERMINAL_VY) P.vy = -MC_TERMINAL_VY;
       if (P.on_ground && Bt(kbd.down_bitmap, MC_SC_SPACE)) {
         P.vy = MC_JUMP_VEL;
         P.on_ground = FALSE;
@@ -979,7 +1142,7 @@ U0 HolyCraft()
 {
   Bool quit = FALSE, underwater;
   I64 fps = 0, frames = 0, x, y, u, bx, by, bz;
-  F64 t0, t1, dt, fps_t;
+  F64 t0, t1, dt, fps_t, phys_acc;
   SettingsPush;
   Fs->win_inhibit = WIG_TASK_DFT;
   WinMax;
@@ -996,7 +1159,7 @@ U0 HolyCraft()
   stride = gr.dc->width_internal;
   scr_w = gr.dc->width;
   scr_h = gr.dc->height;
-  t0 = NowSecs();  fps_t = t0;
+  t0 = NowSecs();  fps_t = t0;  phys_acc = 0.0;
   try {
     while (!quit) {
       t1 = NowSecs();
@@ -1007,7 +1170,12 @@ U0 HolyCraft()
       last_dt = dt;
       if (kbd.scan_code == SC_ESC) quit = TRUE;
       HandleInput;
-      UpdatePlayer(dt);
+      phys_acc += dt;
+      if (phys_acc > 0.1) phys_acc = 0.1;   // don't spiral after a stall
+      while (phys_acc >= MC_STEP_TIME) {
+        UpdatePlayer(MC_STEP_TIME);
+        phys_acc -= MC_STEP_TIME;
+      }
       UpdateCamera;
       scr_w = gr.dc->width;
       scr_h = gr.dc->height;

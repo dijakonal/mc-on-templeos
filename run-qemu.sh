@@ -15,5 +15,5 @@ qemu-system-x86_64 \
   -rtc base=localtime
 echo ""
 echo "Inside TempleOS, run the game with:"
-echo '  #include "D:/MCRAFT.HC";'
-echo "(If the game is not on D:, first run: Mount(1);  then check the drive letter it prints.)"
+echo '  #include "C:/MCRAFT.HC";'
+echo "(fat.img is an MBR disk with one FAT32 partition; TempleOS mounts it as C:.)"

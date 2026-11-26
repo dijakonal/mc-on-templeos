@@ -7,8 +7,10 @@ from tosz_compress import compress
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SRC_ISO = os.path.join(BASE, 'TempleOS.ISO')
-DST_ISO = os.path.join(BASE, 'TempleOS-HolyCraft.ISO')
-GAME    = os.path.join(BASE, 'MCRAFT.HC')
+DST_ISO = os.environ.get('HOLYCRAFT_ISO',
+                         os.path.join(BASE, 'TempleOS-HolyCraft.ISO'))
+GAME    = os.environ.get('HOLYCRAFT_GAME',
+                         os.path.join(BASE, 'MCRAFT.HC'))
 
 LAUNCHER = b'''//HolyCraft launcher: runs in the first terminal at boot.
 #include "::/MCRAFT.HC";
