@@ -22,7 +22,7 @@ mkdir -p build
 # -l m:      terrain noise and the renderer use floor/sin/cos/ceil.
 # -l SDL2:   the compat_gpu.HC translation layer opens a window and blits the
 #            framebuffer through the GPU (install libsdl2-dev).
-"$HCC" -o "$OUT" MCRAFT.HC -l m -l SDL2
+"$HCC" -o "$OUT" src/MCRAFT.HC -l m -l SDL2
 
 echo "built $OUT"
 
