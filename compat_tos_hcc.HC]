@@ -1,0 +1,46 @@
+// Color constants (TempleOS 16-color palette indices)
+#define BLACK   0
+#define BLUE    1
+#define GREEN   2
+#define CYAN    3
+#define BROWN   6
+#define LTGRAY  7
+#define DKGRAY  8
+#define LTBLUE  9
+#define LTGREEN 10
+#define LTCYAN  11
+#define LTRED   12
+#define YELLOW  14
+#define WHITE   15
+
+// Scan codes / task flags
+#define SC_CURSOR_LEFT  0x4B
+#define SC_CURSOR_RIGHT 0x4D
+#define SC_CURSOR_UP    0x48
+#define SC_CURSOR_DOWN  0x50
+#define SC_SHIFT        0x2A
+#define SC_ESC          0x01
+#define WIG_TASK_DFT    0
+
+// Basic type conversion & memory helpers
+I64 ToI64(F64 x) { return (I64)x; }
+
+U0 *MemSet(U0 *dst, I64 val, I64 cnt) {
+  U8 *p = dst;
+  I64 i;
+  for (i = 0; i < cnt; i++) p[i] = val;
+  return dst;
+}
+
+// Stubs for TempleOS-only calls so Linux builds compile & run headlessly
+Bool Bt(U8 *bitfield, I64 bit) { return FALSE; }
+F64 tS() { return 0.0; }
+U0 Sleep(I64 ms) {}
+U0 SettingsPush() {}
+U0 SettingsPop() {}
+U0 WinMax(...) {}
+U0 DocCursor(...) {}
+U0 DocClear() {}
+U0 FlushMsgs() {}
+U0 PutExcept() {}
+U0 GrPrint(...) {}

@@ -94,6 +94,19 @@
 #define MC_SC_6         0x07
 #define MC_SC_SPACE     0x39
 
+
+
+
+#ifndef Bool
+#define Bool I64
+#endif
+
+#include "compat_hcc.HC"
+
+
+
+
+
 class CBlockInfo {
   U8 *name;
   U8 top_a, top_b;      // lit / shade dither colors for the top face
@@ -1144,11 +1157,14 @@ U0 HolyCraft()
   I64 fps = 0, frames = 0, x, y, u, bx, by, bz;
   F64 t0, t1, dt, fps_t, phys_acc;
   SettingsPush;
-  Fs->win_inhibit = WIG_TASK_DFT;
+  SET_WIN_INHIBIT(WIG_TASK_DFT);
   WinMax;
   DocCursor;
   DocClear;
   FlushMsgs;
+  #ifdef __HCC__
+  InitHCCCompat;
+  #endif
   InitBlocks;
   InitRendererTables;
   GenWorld;
@@ -1205,8 +1221,8 @@ U0 HolyCraft()
   FlushMsgs;
   SettingsPop;
   DocClear;
-  Print("HolyCraft closed.\n"
-        "$FG,LTGREEN$Run it again by including MCRAFT.HC.$FG$\n");
+  Print("HolyCraft closed.\n");
+  Print("$FG,LTGREEN$Run it again by including MCRAFT.HC.$FG$\n");
 }
 
 HolyCraft;
