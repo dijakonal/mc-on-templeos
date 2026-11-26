@@ -32,6 +32,8 @@ required. For the layered build, boot `TempleOS-HolyCraft-GPU.ISO` instead.
 | `tos/` | Extracted TempleOS headers/sources used by the linter |
 | `run-qemu.sh`, `make-fat-image.sh`, `fat.img` | Optional: boot stock TempleOS with the source on an MBR/FAT32 disk |
 | `screenshots/` | QEMU screenshots proving boot, walking, breaking, placing and both graphics backends |
+| `compile-linux.sh` | Builds `build/mcraft`, a native Linux binary with an SDL2 window |
+| `compat_hcc.HC`, `compat_gpu.HC`, `compat_font.HC` | Linux shims, SDL2 GPU blit/input layer, 8x8 HUD font |
 
 ## Run it
 
@@ -56,6 +58,20 @@ The same ISO also runs on other VGA devices; for example `-vga cirrus` selects
 the TempleOS 16-color fallback and still renders the full game. The RGB path is
 QEMU/Bochs-specific, so the layered ISO is not the shipping ISO for real
 hardware.
+
+### Run natively on Linux
+
+`compat_gpu.HC` translates the game's 640x480 indexed framebuffer and keyboard /
+mouse into an SDL2 window, so it runs on a normal Linux desktop (install
+`libsdl2-dev`):
+
+```bash
+./compile-linux.sh          # builds build/mcraft
+./compile-linux.sh --run    # builds and launches it
+```
+
+Debug helpers: `HCC_DEBUG=1` prints the SDL video driver and window geometry;
+`HCC_PPM=/tmp/fb.ppm` dumps the raw framebuffer as a PPM image every 60 frames.
 
 ## Controls
 

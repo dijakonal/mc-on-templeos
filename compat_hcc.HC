@@ -1,8 +1,13 @@
-// compat_hcc.HC — Linux shims for compiling MCRAFT.HC with hcc
+// compat_hcc.HC — Linux shims for compiling/running MCRAFT.HC with hcc.
+#ifndef COMPAT_HCC_HC
+#define COMPAT_HCC_HC
+
 #include <Math.HC>
 #include <Mem.HC>
-// usleep is a libc function; we'll call it via extern
-extern U0 usleep(I64 usec);
+
+#ifndef Bool
+#define Bool I64
+#endif
 
 // Color constants (TempleOS 16-color palette indices)
 #define BLACK   0
@@ -39,6 +44,7 @@ extern U0 usleep(I64 usec);
 #define MC_SC_F 0x21
 #endif
 
+// TempleOS's CTask has a win_inhibit field; hcc's host CTask does not.
 #ifdef __HCC__
 #define SET_WIN_INHIBIT(x)
 #else
@@ -82,20 +88,20 @@ CHCCGr gr;
 CHCCKbd kbd;
 CHCCMs ms;
 
+// 640x480 8-bit indexed framebuffer written directly by the game.
 U8 _hcc_fb[640 * 480];
 
-U0 InitHCCCompat() {
-  _hcc_dc.color = WHITE;
-  _hcc_dc.body = _hcc_fb;
-  _hcc_dc.width_internal = 640;
-  _hcc_dc.width = 640;
-  _hcc_dc.height = 480;
-  gr.dc = &_hcc_dc;
+#include "compat_font.HC"
+#include "compat_gpu.HC"
+
+// TempleOS bit test: read bit `bit` of a 256-bit field (U64[4]).
+Bool Bt(U0 *bitfield, I64 bit)
+{
+  U64 *p = (U64 *)bitfield;
+  return (p[bit >> 6] >> (bit & 63)) & 1;
 }
 
-Bool Bt(U0 *bitfield, I64 bit) { return FALSE; }
-F64 tS() { return 0.0; }
-U0 Sleep(I64 ms_delay) { usleep(ms_delay * 1000); }
+// Remaining TempleOS shims that have no Linux equivalent.
 U0 SettingsPush() {}
 U0 SettingsPop() {}
 U0 WinMax(...) {}
@@ -103,4 +109,5 @@ U0 DocCursor(...) {}
 U0 DocClear() {}
 U0 FlushMsgs() {}
 U0 PutExcept() {}
-U0 GrPrint(...) {}
+
+#endif // COMPAT_HCC_HC
