@@ -4,7 +4,8 @@
 The normal MCRAFT.HC stays 640x480/16-color for real TempleOS hardware.  This
 script adds a small graphics layer: an RGB back buffer, a QEMU Bochs-VBE
 800x600x32 backend, a TempleOS 16-color fallback backend, and classic
-16x16 Minecraft-style face textures sampled with fixed-point UV interpolation.
+16x16 Minecraft-style face textures sampled with perspective-correct
+fixed-point UV interpolation.
 """
 import os
 import random
@@ -236,6 +237,7 @@ def _texture_code():
 GPU_BLOCK = r'''#define GPU_W            800
 #define GPU_H            600
 #define GPU_ALPHA_WATER  140
+#define GPU_PERSPECTIVE_SCALE 4096
 
 // HolyCraft graphical layer: one RGB back buffer, two backends.
 //   * QEMU Bochs VBE: 800x600x32, one MemCpy present
@@ -255,6 +257,7 @@ U32  haze_col;
 U32 *face_cols;
 U64 gt_rows[B_COUNT * 6 * 16];           // 16 rows of packed 16x16 texel shades
 U8  gt_tex[B_COUNT * 6 * 256];           // unpacked texel shades for the hot loop
+U32 gl_inv[65537];                       // fixed-point reciprocals for perspective divide
 
 I64 GLColorToIndexSlow(U32 c)
 {
@@ -449,7 +452,10 @@ U0 GpuBlockColor(I64 blk, I64 dir, I64 bx, I64 by, I64 bz, U32 *ca, U32 *cb)
 // indices; unpack once into bytes so the rasterizer stays a single array read.
 U0 GpuTextureInit()
 {
-  I64 idx, t, k;
+  I64 idx, t, k, q;
+  gl_inv[0] = 1073741824;
+  for (q = 1; q <= 65536; q++)
+    gl_inv[q] = 1073741824 / q;
 GT_ROW_ASSIGNMENTS
   for (idx = 0; idx < B_COUNT * 6 * 16; idx++)
     for (t = 0; t < 16; t++) {
@@ -538,13 +544,14 @@ U0 GpuFontInit()
 
 FILL_FACE = r'''U0 FillFace(I64 fi)
 {
-  I64 n, e, a, b2, y, ymin, ymax, x, x0, x1, row, ti, tx, ty, alpha, blk, dir, texbase;
-  I64 ul, ur, vl, vr, tu, tv, du, dv, ua, ub, va, vb;
-  F64 xl, xr, t, yy0, yy1, xa, xb, fmin, fmax;
-  U32 c;
+  I64 n, e, a, b2, y, ymin, ymax, x, x0, x1, row, tx, ty, alpha, blk, dir, texbase;
+  I64 fbase, ul, ur, vl, vr, wl, wr, tu, tv, ww, du, dv, dw, upx, upy, inv;
+  I64 ua, ub, va, vb, wa, wb;
+  F64 xl, xr, t, yy0, yy1, xa, xb, fmin, fmax, xspan, t0;
   n = fnverts[fi];
   alpha = falpha[fi];  blk = fblk[fi];  dir = fdir[fi];
   texbase = (blk * 6 + dir) * 256;
+  fbase = fi * 16;
   fmin = 1e30;  fmax = -1e30;
   for (e = 0; e < n; e++) {
     if (fys[fi * 5 + e] < fmin) fmin = fys[fi * 5 + e];
@@ -553,7 +560,7 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
   ymin = IClamp(ToI64(Ceil(fmin)), 0, scr_h - 1);
   ymax = IClamp(ToI64(Floor(fmax)), 0, scr_h - 1);
   for (y = ymin; y <= ymax; y++) {
-    xl = 1e9;  xr = -1e9;  ul = ur = vl = vr = 0;
+    xl = 1e9;  xr = -1e9;  ul = ur = vl = vr = wl = wr = 0;
     for (e = 0; e < n; e++) {
       a = e;  b2 = (e + 1) % n;
       yy0 = fys[fi * 5 + a];  yy1 = fys[fi * 5 + b2];
@@ -562,14 +569,17 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
         xa = fxs[fi * 5 + a];  xb = fxs[fi * 5 + b2];
         ua = ftu[fi * 5 + a];  ub = ftu[fi * 5 + b2];
         va = ftv[fi * 5 + a];  vb = ftv[fi * 5 + b2];
+        wa = fiw[fi * 5 + a];  wb = fiw[fi * 5 + b2];
         x = xa + (xb - xa) * t;
         if (x < xl) {
           xl = x;
           ul = ToI64(ua + (ub - ua) * t);  vl = ToI64(va + (vb - va) * t);
+          wl = ToI64(wa + (wb - wa) * t);
         }
         if (x > xr) {
           xr = x;
           ur = ToI64(ua + (ub - ua) * t);  vr = ToI64(va + (vb - va) * t);
+          wr = ToI64(wa + (wb - wa) * t);
         }
       }
     }
@@ -577,22 +587,46 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
       x0 = IClamp(ToI64(Ceil(xl)), 0, scr_w - 1);
       x1 = IClamp(ToI64(Floor(xr)), 0, scr_w - 1);
       row = y * stride;
+      // Interpolate u/z, v/z and 1/z linearly across the span, then divide
+      // per pixel through the reciprocal table.  Dividing only at the ends
+      // and lerping the quotients lets texels swim on oblique faces; the
+      // per-pixel divide pins every texel to its world position.
       if (xr > xl) {
-        du = (ur - ul) / ToI64(xr - xl);
-        dv = (vr - vl) / ToI64(xr - xl);
+        xspan = xr - xl;
+        wl = IClamp(wl, 1, 65536);  wr = IClamp(wr, 1, 65536);
+        t0 = (x0 - xl) / xspan;
+        du = ToI64((ur - ul) * 65536.0 / xspan);
+        dv = ToI64((vr - vl) * 65536.0 / xspan);
+        dw = ToI64((wr - wl) * 65536.0 / xspan);
+        tu = ToI64((ul + (ur - ul) * t0) * 65536.0);
+        tv = ToI64((vl + (vr - vl) * t0) * 65536.0);
+        ww = ToI64((wl + (wr - wl) * t0) * 65536.0);
       } else {
-        du = 0;  dv = 0;
+        wl = IClamp(wl, 1, 65536);
+        du = 0;  dv = 0;  dw = 0;
+        tu = ul << 16;  tv = vl << 16;  ww = wl << 16;
       }
-      tu = ul + (x0 - ToI64(xl)) * du;
-      tv = vl + (x0 - ToI64(xl)) * dv;
-      for (x = x0; x <= x1; x++) {
-        tx = (tu >> 8) & 15;
-        ty = (tv >> 8) & 15;
-        ti = gt_tex[texbase + (ty << 4) + tx];
-        c = face_cols[fi * 16 + ti];
-        if (alpha == 255) db[row + x] = c;
-        else db[row + x] = GpuMix(db[row + x], c, alpha);
-        tu += du;  tv += dv;
+      if (alpha == 255) {
+        for (x = x0; x <= x1; x++) {
+          inv = gl_inv[ww >> 16];
+          upx = (tu * inv) >> 46;
+          upy = (tv * inv) >> 46;
+          tx = (upx >> 8) & 15;
+          ty = (upy >> 8) & 15;
+          db[row + x] = face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]];
+          tu += du;  tv += dv;  ww += dw;
+        }
+      } else {
+        for (x = x0; x <= x1; x++) {
+          inv = gl_inv[ww >> 16];
+          upx = (tu * inv) >> 46;
+          upy = (tv * inv) >> 46;
+          tx = (upx >> 8) & 15;
+          ty = (upy >> 8) & 15;
+          db[row + x] = GpuMix(db[row + x],
+                               face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]], alpha);
+          tu += du;  tv += dv;  ww += dw;
+        }
       }
     }
   }
@@ -774,11 +808,12 @@ def main():
                      'gpu helpers after framebuffer globals')
     s = replace_once(s, 'U8   *fcolA;\nU8   *fcolB;',
                      'U32  *fcolA;\nU32  *fcolB;\nU8   *falpha;\n'
-                        'I64  *ftu;\nI64  *ftv;\nI64  *fblk;\nI64  *fdir;', 'face colors')
+                        'I64  *ftu;\nI64  *ftv;\nI64  *fiw;\nI64  *fblk;\nI64  *fdir;', 'face colors')
     s = replace_once(s, '  fcolA   = MAlloc(MC_MAX_FACES);\n  fcolB   = MAlloc(MC_MAX_FACES);',
                      '  fcolA   = MAlloc(MC_MAX_FACES * 4);\n  fcolB   = MAlloc(MC_MAX_FACES * 4);\n  falpha  = MAlloc(MC_MAX_FACES);\n'
                         '  ftu     = MAlloc(MC_MAX_FACES * 5 * 8);\n'
                         '  ftv     = MAlloc(MC_MAX_FACES * 5 * 8);\n'
+                        '  fiw     = MAlloc(MC_MAX_FACES * 5 * 8);\n'
                         '  fblk    = MAlloc(MC_MAX_FACES * 8);\n'
                         '  fdir    = MAlloc(MC_MAX_FACES * 8);\n'
                         '  face_cols = MAlloc(MC_MAX_FACES * 16 * 4);', 'face alloc')
@@ -803,7 +838,7 @@ def main():
                      '  I64 i, j, nv, ci, cj, fi, cidx, x, y, sx, sy, xmin, xmax, ymin, ymax, st, blk;',
                      'emit face vars')
     s = replace_once(s, '  F64 cx[4], cy[4], cz[4], ox[5], oy[5], oz[5], t, wx, wy, wz, depth, fogt;',
-                     '  F64 cx[4], cy[4], cz[4], ox[5], oy[5], oz[5], t, wx, wy, wz, depth, fogt;\n'
+                     '  F64 cx[4], cy[4], cz[4], ox[5], oy[5], oz[5], t, wx, wy, wz, depth, fogt, pp;\n'
                         '  I64 ou[5], ov[5], cu[5], cv[5];', 'emit face uv arrays')
     s = replace_once(s, '    wz = bz + corn_z[cidx] - cam_ez;\n'
                         '    cx[i] = wx * cam_rx + wy * cam_ry + wz * cam_rz;',
@@ -826,8 +861,10 @@ def main():
                         '      nv++;', 'clip vertex uv')
     s = replace_once(s, '    fys[fcount * 5 + i] = syy;',
                      '    fys[fcount * 5 + i] = syy;\n'
-                        '    ftu[fcount * 5 + i] = cu[i];\n'
-                        '    ftv[fcount * 5 + i] = cv[i];', 'project uv')
+                        '    pp = GPU_PERSPECTIVE_SCALE / oz[i];\n'
+                        '    ftu[fcount * 5 + i] = ToI64(cu[i] * pp);\n'
+                        '    ftv[fcount * 5 + i] = ToI64(cv[i] * pp);\n'
+                        '    fiw[fcount * 5 + i] = ToI64(pp);', 'project uv')
     s = replace_once(s, '  st = face_light[dir] * 15;', '  st = face_light[dir] * 255;', 'shade scale')
     s = replace_once(s, '  ffogT[fi]   = fogt * 15;',
                      '  ffogT[fi]   = fogt * 255;\n'
@@ -863,7 +900,8 @@ def main():
     s = ('// HolyCraft graphical-layer build generated by make_gpu_source.py.\n'
          '// RGB back buffer with Bochs VBE 800x600x32 when available, otherwise\n'
          '// the TempleOS 640x480/16-color backend. Frames are double-buffered\n'
-         '// and block faces use classic 16x16 Minecraft-style textures.\n') + s
+         '// and block faces use classic 16x16 Minecraft-style textures with\n'
+         '// perspective-correct fixed-point UV interpolation.\n') + s
     open(DST, 'w').write(s)
     print('wrote', DST, len(s), 'bytes')
 

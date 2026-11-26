@@ -104,10 +104,14 @@ hotbar. Bedrock cannot be broken; you cannot place a block inside yourself.
   Render distance is reduced to 9 blocks in the layered build to keep TCG
   performance usable.
 * Classic 16x16 Minecraft-style face textures. Each face carries UV
-  coordinates through near-plane clipping and scanline rasterization;
-  fixed-point interpolation selects texels from per-block patterns: grass
-  edges, dirt speckles, stone cracks, wood grain/rings, ore blobs, sand,
-  water ripples, leaf holes, snow, gravel and bedrock. These are original
+  coordinates through near-plane clipping and scanline rasterization.
+  `u/z`, `v/z` and `1/z` are interpolated linearly across every scanline and
+  divided per pixel through a fixed-point reciprocal table, so texels stay
+  locked to block faces instead of swimming as the camera moves. (An earlier
+  build divided only at the scanline endpoints and lerped the quotients
+  across the span, which let oblique texels slide.) Patterns include grass
+  edges, dirt speckles, stone cracks, wood grain/rings, ore blobs, sand, water
+  ripples, leaf holes, snow, gravel and bedrock. These are original
   approximations, not Mojang texture assets.
 
 ## How the ISO auto-launches
@@ -208,18 +212,22 @@ moved 2.42 blocks; left click changed 8059 pixels and right click changed
 3597 pixels. Jump raised the player from Y 16.0 to 17.2 and landed back at
 16.0.
 
-GPU-ISO check on `-vga std`: `HOLYCRAFT FPS 11 X 45.5 Y 16.0 Z 49.5` at
-800x600x32, with the HUD present in 5/5 consecutive screenshots. The same ISO
-on `-vga cirrus` produced a fully rendered 640x480 16-color scene at 12 FPS
-in 4/5 samples (one 8 FPS transient) and a readable HUD in 5/5 samples. The
-fallback is dominated by brown/green/blue instead of gray after the
-saturation-aware quantization fix. Texture patterns raised the unique colors
-in the central scene region from 196 to 240 while lowering adjacent-pixel
-changes from 93% to 33%, i.e. coherent 16x16 texels rather than screen-space
-Bayer noise. Fixed-point UV interpolation and one byte read per texel keep the
-Minecraft-style renderer at the same 11 FPS as the untextured one. `gpu_hud.py`
-reads this HUD with the same exact-bitmap approach as `glyph_ocr.py`, but for
-the inline 5x7 font.
+GPU-ISO check on `-vga std`: `HOLYCRAFT FPS 7 X 45.5 Y 16.0 Z 49.5` at
+800x600x32 (6-9 FPS while moving), HUD readable in every screenshot. The same
+ISO on `-vga cirrus` renders the full 640x480 16-color scene at ~7 FPS with a
+readable HUD; the fallback is dominated by brown/green/blue instead of gray
+after the saturation-aware quantization fix, and texture patterns raise the
+unique colors in the central scene region well above the flat palette.
+Rendering sanity on the textured build: consecutive static-camera
+screenshots are pixel-identical outside the HUD row (no shimmer), and
+rotation/walking frames keep texture features attached to block edges. As an
+A/B check, the old endpoint-affine loop (divide at the scanline endpoints,
+lerp the quotients across the span) was rebuilt and captured at the identical
+spawn pose: 10.8% of all pixels differ from the per-pixel build — the spatial
+texel drift behind the reported morphing. The per-pixel reciprocal divide
+costs about 1-2 FPS versus that affine loop.
+`gpu_hud.py` reads this HUD with the same exact-bitmap approach as
+`glyph_ocr.py`, but for the inline 5x7 font.
 
 Reproduce with:
 
