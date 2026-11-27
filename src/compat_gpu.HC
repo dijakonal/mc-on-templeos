@@ -69,11 +69,21 @@ class SDL_MouseButtonEvent {
   I32 y;
 };
 
+class SDL_WindowEvent {
+  U32 type;
+  U32 timestamp;
+  U32 windowID;
+  U8  event;
+  I32 data1;
+  I32 data2;
+};
+
 union SDL_Event {
   U32                  type;
   SDL_KeyboardEvent    key;
   SDL_MouseMotionEvent motion;
   SDL_MouseButtonEvent button;
+  SDL_WindowEvent      window;
   U8                   padding[64];
 };
 
@@ -94,6 +104,11 @@ union SDL_Event {
 
 #define SDL_BUTTON_LEFT  1
 #define SDL_BUTTON_RIGHT 3
+
+#define SDL_WINDOWEVENT              0x108
+#define SDL_WINDOW_ENTER             10
+#define SDL_WINDOWEVENT_ENTER        10
+#define SDL_WINDOW_FOCUS_GAINED 12
 
 #define SDLK_ESCAPE       27
 #define SDLK_SPACE        ' '
@@ -310,6 +325,17 @@ U0 HCC_PumpEvents()
         ms.pos.y = ev.button.y;
         if (ev.button.button == SDL_BUTTON_LEFT)  ms.lb = FALSE;
         if (ev.button.button == SDL_BUTTON_RIGHT) ms.rb = FALSE;
+        break;
+      case SDL_WINDOWEVENT:
+        // SDL turns relative mouse mode off when the window loses focus;
+        // re-enable it when the window is focused/entered again, otherwise
+        // the look controls go wild after an alt-tab.
+        if (ev.window.event == SDL_WINDOW_FOCUS_GAINED ||
+            ev.window.event == SDL_WINDOW_ENTER) {
+          SDL_SetRelativeMouseMode(SDL_TRUE);
+          SDL_ShowCursor(SDL_FALSE);
+          _hcc_relative_mouse = 1;
+        }
         break;
     }
   }

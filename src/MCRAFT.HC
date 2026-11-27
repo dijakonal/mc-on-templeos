@@ -112,10 +112,6 @@
 #include "compat_hcc.HC"
 #endif
 
-
-
-
-
 class CBlockInfo {
   U8 *name;
   U8 top_a, top_b;      // lit / shade dither colors for the top face
