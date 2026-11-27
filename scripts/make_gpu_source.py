@@ -387,6 +387,27 @@ U0 GpuUnderwaterInit()
     uwater_lut[i] = GpuMix(GpuRgb(0, 34, 68), GpuRgb(0, 102, 170), i * 17);
 }
 
+// Per-pixel distance fog: fog_w_lut[q] is the fog amount (0..255) for a
+// reciprocal-depth slot.  FillFace indexes it with ww >> 22, where ww is
+// the linearly interpolated 1/z attribute (fiw << 16), so q == fiw >> 6
+// and q * 64 + 32 approximates fiw.  Fog is blended per pixel only on
+// faces inside the transition band, which removes the per-face fog
+// stair-stepping between adjacent blocks.
+U32 mcr_fog_col;
+U8  fog_w_lut[1024];
+U0 GpuFogInit()
+{
+  I64 q;
+  F64 z, fogt;
+  mcr_fog_col = GpuRgb(169, 214, 242);
+  for (q = 0; q < 1024; q++) {
+    z = GPU_PERSPECTIVE_SCALE / (q * 64.0 + 32.0);
+    fogt = (z - MC_FOG_START) / MC_FOG_SPAN;
+    fogt = FClamp(fogt, 0.0, 1.0);
+    fog_w_lut[q] = ToI64(fogt * 255.0);
+  }
+}
+
 U32 GpuScale(U32 c, I64 pct)
 {
   I64 r, g, b;
@@ -558,7 +579,8 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
 {
   I64 n, e, a, b2, y, ymin, ymax, x, x0, x1, row, tx, ty, alpha, blk, dir, texbase;
   I64 fbase, ul, ur, vl, vr, wl, wr, tu, tv, ww, du, dv, dw, upx, upy, inv;
-  I64 ua, ub, va, vb, wa, wb;
+  I64 ua, ub, va, vb, wa, wb, fb, band, fullfog;
+  U32 c;
   F64 xl, xr, t, yy0, yy1, xa, xb, fmin, fmax, xspan, t0;
   n = fnverts[fi];
   alpha = falpha[fi];  blk = fblk[fi];  dir = fdir[fi];
@@ -618,14 +640,29 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
         du = 0;  dv = 0;  dw = 0;
         tu = ul << 16;  tv = vl << 16;  ww = wl << 16;
       }
-      if (alpha == 255) {
+      fullfog = ffogT[fi] == 255;
+      band = ffogT[fi] > 0 && ffogT[fi] < 255;
+      if (fullfog) {
+        // Beyond the fog end no texels are visible; just paint the fog.
+        if (alpha == 255) {
+          for (x = x0; x <= x1; x++) db[row + x] = mcr_fog_col;
+        } else {
+          for (x = x0; x <= x1; x++)
+            db[row + x] = GpuMix(db[row + x], mcr_fog_col, alpha);
+        }
+      } else if (alpha == 255) {
         for (x = x0; x <= x1; x++) {
           inv = gl_inv[ww >> 16];
           upx = (tu * inv) >> 46;
           upy = (tv * inv) >> 46;
           tx = (upx >> 8) & 15;
           ty = (upy >> 8) & 15;
-          db[row + x] = face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]];
+          c = face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]];
+          if (band) {
+            fb = fog_w_lut[ww >> 22];
+            if (fb > 0) c = GpuMix(c, mcr_fog_col, fb);
+          }
+          db[row + x] = c;
           tu += du;  tv += dv;  ww += dw;
         }
       } else {
@@ -635,8 +672,12 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
           upy = (tv * inv) >> 46;
           tx = (upx >> 8) & 15;
           ty = (upy >> 8) & 15;
-          db[row + x] = GpuMix(db[row + x],
-                               face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]], alpha);
+          c = face_cols[fbase + gt_tex[texbase + (ty << 4) + tx]];
+          if (band) {
+            fb = fog_w_lut[ww >> 22];
+            if (fb > 0) c = GpuMix(c, mcr_fog_col, fb);
+          }
+          db[row + x] = GpuMix(db[row + x], c, alpha);
           tu += du;  tv += dv;  ww += dw;
         }
       }
@@ -649,13 +690,16 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
 SKY_HUD = r'''U0 DrawSky()
 {
   F64 sx, sy, u, v, t, cz;
-  I64 y, row, x, horizon;
+  I64 y, row, x, horizon, hw;
   U32 c;
   horizon = scr_h * 0.5 + Sin(P.pitch) / Cos(P.pitch) * gpu_focal;
   horizon = IClamp(horizon, -scr_h, 2 * scr_h);
   for (y = 0; y < scr_h; y++) {
     c = sky_row[y];
-    if (y >= horizon - 6 && y <= horizon + 6) c = haze_col;
+    // Haze peaks at the horizon and fades out over +/-6 rows instead of
+    // being a hard band.
+    hw = 255 - ToI64(FFabs(y - horizon) * 42.5);
+    if (hw > 0) c = GpuMix(c, haze_col, hw);
     MemSetU32(db + y * stride, c, scr_w);
   }
   cz = 0.45 * cam_fx + 0.75 * cam_fy + 0.45 * cam_fz;
@@ -891,9 +935,7 @@ def main():
     s = replace_once(s, '  ffogT[fi]   = fogt * 15;',
                      '  ffogT[fi]   = fogt * 255;\n'
                         '  for (i = 0; i < 16; i++) {\n'
-                        '    c = GpuMix(ca, cb, i * 16);\n'
-                        '    if (ffogT[fi]) c = GpuMix(c, GpuRgb(169, 214, 242), ffogT[fi]);\n'
-                        '    face_cols[fi * 16 + i] = c;\n'
+                        '    face_cols[fi * 16 + i] = GpuMix(ca, cb, i * 16);\n'
                         '  }', 'fog scale')
 
     s = cut_replace(s, 'U0 DrawSky()\n{', '// =============================== GAMEPLAY',
@@ -905,7 +947,7 @@ def main():
                      'underwater')
 
     s = replace_once(s, '  InitBlocks;\n  InitRendererTables;',
-                     '  InitBlocks;\n  GLInit;\n  GpuUnderwaterInit;\n  InitRendererTables;', 'gl init call')
+                     '  InitBlocks;\n  GLInit;\n  GpuUnderwaterInit;\n  GpuFogInit;\n  InitRendererTables;', 'gl init call')
     s = replace_once(s, '  db = gr.dc->body;\n  stride = gr.dc->width_internal;\n'
                         '  scr_w = gr.dc->width;\n  scr_h = gr.dc->height;',
                      '  gpu_back = MAlloc(gpu_w * gpu_h * 4);\n'

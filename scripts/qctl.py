@@ -70,15 +70,28 @@ def ppm_to_png(src, dst):
     png += chunk(b'IEND', b'')
     open(dst, 'wb').write(png)
 
+USAGE = """qctl.py — QEMU monitor helper (HMP socket /tmp/opencode/qmon.sock)
+  qctl.py type TEXT        type text into the guest
+  qctl.py key KEYSPEC      HMP sendkey (e.g. "w 1500" holds W for 1.5 s)
+  qctl.py shot TAG         screendump -> TAG.ppm + TAG.png (absolute paths ok)
+  qctl.py cmd HMP_COMMAND  raw monitor command
+"""
+
 if __name__ == '__main__':
+    if len(sys.argv) < 2 or sys.argv[1] in ('--help', '-h'):
+        print(USAGE)
+        sys.exit(0 if len(sys.argv) > 1 else 1)
     if sys.argv[1] == 'type':
         type_text(sys.argv[2])
     elif sys.argv[1] == 'key':
         mon("sendkey " + sys.argv[2])
     elif sys.argv[1] == 'shot':
         p = sys.argv[2]
-        screendump(p + '.ppm')
-        ppm_to_png(p + '.ppm', p + '.png')
-        print(p + '.png')
+        if not os.path.isabs(p):
+            p = os.path.join('/tmp/opencode', p)
+        base = p[:-4] if p.endswith('.ppm') else p
+        screendump(base + '.ppm')
+        ppm_to_png(base + '.ppm', base + '.png')
+        print(base + '.png')
     elif sys.argv[1] == 'cmd':
         print(mon(sys.argv[2]))

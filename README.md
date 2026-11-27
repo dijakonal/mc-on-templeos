@@ -33,7 +33,9 @@ required. For the layered build, boot `TempleOS-HolyCraft-GPU.ISO` instead.
 | `run-qemu.sh`, `make-fat-image.sh`, `fat.img` | Optional: boot stock TempleOS with the source on an MBR/FAT32 disk |
 | `screenshots/` | QEMU screenshots proving boot, walking, breaking, placing and both graphics backends |
 | `compile-linux.sh` | Builds `build/mcraft`, a native Linux binary with an SDL2 window |
+| `patches/hcc-scientific-notation.patch` | Required hcc lexer fix for the Linux port (scientific-notation literals) |
 | `src/compat_hcc.HC`, `src/compat_gpu.HC`, `src/compat_font.HC` | Linux shims, SDL2 GPU blit/input layer, 8x8 HUD font |
+| `scripts/raster_ab_test.py` | Boots the GPU ISO against an endpoint-affine baseline ISO and diffs them (rasterizer regression test) |
 
 ## Run it
 
@@ -63,15 +65,24 @@ hardware.
 
 `compat_gpu.HC` translates the game's 640x480 indexed framebuffer and keyboard /
 mouse into an SDL2 window, so it runs on a normal Linux desktop (install
-`libsdl2-dev`):
+`libsdl2-dev`). The compiler must be hcc v0.0.17-beta **with**
+`patches/hcc-scientific-notation.patch` applied — without it hcc parses
+`1e-9` as `(1 e) - 9` and every F64 constant multiply in the game (gravity,
+noise, fog timing) is silently wrong:
 
 ```bash
+git clone https://github.com/Jamesbarford/holyc-lang.git
+cd holyc-lang
+git apply ../patches/hcc-scientific-notation.patch
+make C_COMPILER=cc BUILD_TYPE=Release && sudo make install
+cd ..
 ./compile-linux.sh          # builds build/mcraft
 ./compile-linux.sh --run    # builds and launches it
 ```
 
-Debug helpers: `HCC_DEBUG=1` prints the SDL video driver and window geometry;
-`HCC_PPM=/tmp/fb.ppm` dumps the raw framebuffer as a PPM image every 60 frames.
+The port renders and plays the full game (measured ~88 FPS under Xvfb). The
+underwater overlay, per-pixel fog and HUD text all go through the same code
+paths as the TempleOS builds.
 
 ## Controls
 
@@ -111,14 +122,22 @@ hotbar. Bedrock cannot be broken; you cannot place a block inside yourself.
   selects a backend and `GLPresent` publishes a finished frame, so the HUD no
   longer flickers while a frame is being composed.
   * Bochs VBE backend: PCI probe, 800x600x32 linear framebuffer, RGB block
-    colors with per-column variation, smoothed sky gradient, translucent water,
-    inline 5x7 HUD font and precomputed shading/fog/sky lookup tables.
+    colors with per-column variation, smoothed sky gradient with a soft haze
+    falloff at the horizon, translucent water, inline 5x7 HUD font and
+    precomputed shading/fog/sky lookup tables.
   * TempleOS backend: converts the RGB back buffer to the native 640x480
     16-color framebuffer if Bochs VBE is absent. Conversion uses a
     saturation-aware 15-bit lookup table, so sky stays blue and grass stays
     green instead of collapsing into the palette's gray entries.
   Render distance is reduced to 9 blocks in the layered build to keep TCG
   performance usable.
+* Per-pixel distance fog in the layered build: faces inside the fog
+  transition band blend fog per pixel through a reciprocal-depth lookup
+  table (the same interpolated `1/z` the texturing uses), which removes the
+  per-face fog stair-stepping between adjacent blocks. Fully fogged faces
+  take a fast path that skips texel sampling entirely. The underwater
+  overlay blends through a precomputed 16-entry Bayer lookup instead of
+  half a million `GpuMix` calls per frame.
 * Classic 16x16 Minecraft-style face textures. Each face carries UV
   coordinates through near-plane clipping and scanline rasterization.
   `u/z`, `v/z` and `1/z` are interpolated linearly across every scanline and
@@ -229,19 +248,19 @@ moved 2.42 blocks; left click changed 8059 pixels and right click changed
 16.0.
 
 GPU-ISO check on `-vga std`: `HOLYCRAFT FPS 7 X 45.5 Y 16.0 Z 49.5` at
-800x600x32 (6-9 FPS while moving), HUD readable in every screenshot. The same
-ISO on `-vga cirrus` renders the full 640x480 16-color scene at ~7 FPS with a
-readable HUD; the fallback is dominated by brown/green/blue instead of gray
-after the saturation-aware quantization fix, and texture patterns raise the
-unique colors in the central scene region well above the flat palette.
-Rendering sanity on the textured build: consecutive static-camera
+800x600x32 (6-8 FPS while moving with per-pixel fog), HUD readable in every
+screenshot. The same ISO on `-vga cirrus` renders the full 640x480 16-color
+scene at ~10 FPS with a readable HUD; the fallback is dominated by
+brown/green/blue instead of gray after the saturation-aware quantization
+fix. Rendering sanity on the textured build: consecutive static-camera
 screenshots are pixel-identical outside the HUD row (no shimmer), and
-rotation/walking frames keep texture features attached to block edges. As an
-A/B check, the old endpoint-affine loop (divide at the scanline endpoints,
-lerp the quotients across the span) was rebuilt and captured at the identical
-spawn pose: 10.8% of all pixels differ from the per-pixel build — the spatial
-texel drift behind the reported morphing. The per-pixel reciprocal divide
-costs about 1-2 FPS versus that affine loop.
+rotation/walking frames keep texture features attached to block edges.
+`scripts/raster_ab_test.py` automates the rasterizer regression check: it
+builds an endpoint-affine baseline ISO (same fog, water and fast paths,
+only the UV interpolation differs), boots both at the identical spawn pose
+and diffs them — expect a substantial pixel difference (the perspective
+error field; ~62% at the spawn pose since the per-pixel fog amplifies it)
+and a failure if the two rasterizers ever look identical.
 `scripts/gpu_hud.py` reads this HUD with the same exact-bitmap approach as
 `scripts/glyph_ocr.py`, but for the inline 5x7 font.
 

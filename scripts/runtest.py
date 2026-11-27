@@ -47,6 +47,12 @@ def boot(tag, delay=85):
 
 
 if __name__ == '__main__':
+    if any(a in ('--help', '-h') for a in sys.argv[1:]):
+        print(__doc__)
+        print('Usage: python3 runtest.py [TAG] [DELAY_SECONDS]')
+        print('Boots the ISO headless (env HOLYCRAFT_ISO, HOLYCRAFT_VGA) and')
+        print('screenshots it to /tmp/opencode/TAG.png after DELAY seconds.')
+        sys.exit(0)
     tag = sys.argv[1] if len(sys.argv) > 1 else 'holycraft'
     delay = int(sys.argv[2]) if len(sys.argv) > 2 else 85
     boot(tag, delay)

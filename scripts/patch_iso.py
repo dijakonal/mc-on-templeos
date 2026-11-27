@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Patch TempleOS.ISO: add MCRAFT.HC + auto-run launcher in Once.HC."""
 import os, struct, sys
+
+if any(a in ('--help', '-h') for a in sys.argv[1:]):
+    print(__doc__)
+    print('Rebuilds the ISO from pristine TempleOS.ISO every run.')
+    print('Env: HOLYCRAFT_GAME (default src/MCRAFT.HC), HOLYCRAFT_ISO')
+    print('(default TempleOS-HolyCraft.ISO). This script takes no options;')
+    print('running it REBUILDS the target ISO.')
+    sys.exit(0)
+
+import sys as _sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from redsea import RedSea
 from tosz_compress import compress
