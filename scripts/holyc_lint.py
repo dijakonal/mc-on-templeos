@@ -12,7 +12,8 @@ import re
 import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-TOS = os.path.join(BASE, 'tos')
+ROOT = os.path.dirname(BASE)
+TOS = os.path.join(ROOT, 'tos')
 DEFINE_RE = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)')
 FUNC_MACRO_RE = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)\(')
 DECL_RE = re.compile(
@@ -137,7 +138,7 @@ def lint(path):
 
 
 if __name__ == '__main__':
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(BASE, 'MCRAFT.HC')
+    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, 'src', 'MCRAFT.HC')
     issues = lint(path)
     if not issues:
         print('OK: no HolyC issues found')

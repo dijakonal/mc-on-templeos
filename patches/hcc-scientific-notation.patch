@@ -1,0 +1,20 @@
+diff --git a/src/lexer.c b/src/lexer.c
+index af9de82..2aee9ef 100644
+--- a/src/lexer.c
++++ b/src/lexer.c
+@@ -826,6 +826,15 @@ static int countNumberLen(Lexer *l, char *ptr, int *isfloat, int *ishex,
+                     return -1;
+                 }
+                 seen_e = 1;
++                /* An exponent makes the literal a float even without a
++                 * decimal point (1e30), and an immediately following sign
++                 * belongs to the exponent (1e-9) rather than being a
++                 * separate operator. */
++                *isfloat = 1;
++                if ((*(ptr + 1) == '+' || *(ptr + 1) == '-') &&
++                    isNum(*(ptr + 2))) {
++                    ptr++;
++                }
+             }
+             break;
+         case 'x':

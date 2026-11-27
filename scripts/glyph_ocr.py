@@ -12,7 +12,8 @@ import sys
 from PIL import Image
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-FONT = json.load(open(os.path.join(BASE, 'holyc_font.json')))
+ROOT = os.path.dirname(BASE)
+FONT = json.load(open(os.path.join(ROOT, 'holyc_font.json')))
 
 
 def load(path):

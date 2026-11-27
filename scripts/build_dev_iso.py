@@ -12,8 +12,9 @@ from redsea import RedSea
 from tosz_compress import compress
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(BASE, 'TempleOS.ISO')
-DST = os.path.join(BASE, 'TempleOS-HolyCraft-DEV.ISO')
+ROOT = os.path.dirname(BASE)
+SRC = os.path.join(ROOT, 'TempleOS.ISO')
+DST = os.path.join(ROOT, 'TempleOS-HolyCraft-DEV.ISO')
 
 LAUNCHER = b'''//HolyCraft dev supervisor: create <drive>:/RELOAD to rebuild the game.
 LBts(&sys_run_level, RLf_ADAM_SERVER);

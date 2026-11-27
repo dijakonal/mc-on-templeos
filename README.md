@@ -20,18 +20,20 @@ required. For the layered build, boot `TempleOS-HolyCraft-GPU.ISO` instead.
 | `TempleOS-HolyCraft.ISO` | Bootable TempleOS CD that auto-launches HolyCraft |
 | `TempleOS-HolyCraft-GPU.ISO` | Bootable CD with the graphical-layer build (VBE RGB or 16-color fallback) |
 | `TempleOS.ISO` | Pristine upstream TempleOS CD (rebuild input) |
-| `MCRAFT.HC` | Complete HolyC game source |
-| `MCRAFT_GPU.HC`, `make_gpu_source.py` | Generated layered source and its generator |
-| `gpu_hud.py` | HUD reader for the GPU build's inline 5x7 font |
-| `patch_iso.py` | Repacks the game into the ISO and patches the boot launcher |
-| `redsea.py`, `tosz_compress.py` | RedSea filesystem reader + Terry's LZW codec used by `patch_iso.py` |
-| `runtest.py`, `qctl.py` | Headless-QEMU boot/screenshot/input helpers |
+| `src/MCRAFT.HC` | Complete HolyC game source |
+| `src/MCRAFT_GPU.HC`, `scripts/make_gpu_source.py` | Generated layered source and its generator |
+| `scripts/gpu_hud.py` | HUD reader for the GPU build's inline 5x7 font |
+| `scripts/patch_iso.py` | Repacks the game into the ISO and patches the boot launcher |
+| `scripts/redsea.py`, `scripts/tosz_compress.py` | RedSea filesystem reader + Terry's LZW codec used by `scripts/patch_iso.py` |
+| `scripts/runtest.py`, `scripts/qctl.py` | Headless-QEMU boot/screenshot/input helpers |
 | `TempleOS-HolyCraft-DEV.ISO` | Dev ISO: boots into a supervisor that hot-reloads `MCRAFT.HC` from `fat.img` |
-| `build_dev_iso.py`, `devbridge.py` | Build the dev ISO and run the hot-reload loop |
-| `holyc_lint.py`, `glyph_ocr.py`, `holyc_font.json` | HolyC static checks + exact-glyph HUD reader |
+| `scripts/build_dev_iso.py`, `scripts/devbridge.py` | Build the dev ISO and run the hot-reload loop |
+| `scripts/holyc_lint.py`, `scripts/glyph_ocr.py`, `holyc_font.json` | HolyC static checks + exact-glyph HUD reader |
 | `tos/` | Extracted TempleOS headers/sources used by the linter |
 | `run-qemu.sh`, `make-fat-image.sh`, `fat.img` | Optional: boot stock TempleOS with the source on an MBR/FAT32 disk |
 | `screenshots/` | QEMU screenshots proving boot, walking, breaking, placing and both graphics backends |
+| `compile-linux.sh` | Builds `build/mcraft`, a native Linux binary with an SDL2 window |
+| `src/compat_hcc.HC`, `src/compat_gpu.HC`, `src/compat_font.HC` | Linux shims, SDL2 GPU blit/input layer, 8x8 HUD font |
 
 ## Run it
 
@@ -56,6 +58,20 @@ The same ISO also runs on other VGA devices; for example `-vga cirrus` selects
 the TempleOS 16-color fallback and still renders the full game. The RGB path is
 QEMU/Bochs-specific, so the layered ISO is not the shipping ISO for real
 hardware.
+
+### Run natively on Linux
+
+`compat_gpu.HC` translates the game's 640x480 indexed framebuffer and keyboard /
+mouse into an SDL2 window, so it runs on a normal Linux desktop (install
+`libsdl2-dev`):
+
+```bash
+./compile-linux.sh          # builds build/mcraft
+./compile-linux.sh --run    # builds and launches it
+```
+
+Debug helpers: `HCC_DEBUG=1` prints the SDL video driver and window geometry;
+`HCC_PPM=/tmp/fb.ppm` dumps the raw framebuffer as a PPM image every 60 frames.
 
 ## Controls
 
@@ -124,23 +140,23 @@ TempleOS executes the root directory's `Once.HC.Z` during startup. The patcher:
    `#include "::/MCRAFT.HC";`, compressed with TempleOS's own LZW format;
 3. reads the ISO back through the filesystem parser to verify the bytes.
 
-`patch_iso.py` always patches from the pristine `TempleOS.ISO`, so rebuilding
+`scripts/patch_iso.py` always patches from the pristine `TempleOS.ISO`, so rebuilding
 after an edit is repeatable:
 
 ```bash
-python3 patch_iso.py
+python3 scripts/patch_iso.py
 ```
 
 To rebuild the layered ISO instead:
 
 ```bash
-python3 make_gpu_source.py
-python3 holyc_lint.py MCRAFT_GPU.HC
-HOLYCRAFT_GAME=$PWD/MCRAFT_GPU.HC \
-HOLYCRAFT_ISO=$PWD/TempleOS-HolyCraft-GPU.ISO python3 patch_iso.py
+python3 scripts/make_gpu_source.py
+python3 scripts/holyc_lint.py src/MCRAFT_GPU.HC
+HOLYCRAFT_GAME=$PWD/src/MCRAFT_GPU.HC \
+HOLYCRAFT_ISO=$PWD/TempleOS-HolyCraft-GPU.ISO python3 scripts/patch_iso.py
 ```
 
-`runtest.py` accepts the same `HOLYCRAFT_ISO` environment variable, plus
+`scripts/runtest.py` accepts the same `HOLYCRAFT_ISO` environment variable, plus
 `HOLYCRAFT_VGA` to select the QEMU VGA device (`std` by default, `cirrus` for
 the TempleOS fallback).
 
@@ -151,20 +167,20 @@ The dev bridge keeps one QEMU VM booted and reloads source from `fat.img` in
 about 30 s, including a full HolyC recompile.
 
 ```bash
-python3 make-fat-image.sh          # MBR + FAT32 disk with MCRAFT.HC on C:
-python3 build_dev_iso.py           # build the dev supervisor ISO (once)
-python3 devbridge.py boot          # boot the VM (~45 s)
-python3 devbridge.py reload        # copy edited source + hot-reload (~35 s)
-python3 devbridge.py key "w 1500"  # send input
-python3 devbridge.py shot          # screenshot + parsed HUD
-python3 devbridge.py stop
+./make-fat-image.sh                # MBR + FAT32 disk with MCRAFT.HC on C:
+python3 scripts/build_dev_iso.py           # build the dev supervisor ISO (once)
+python3 scripts/devbridge.py boot          # boot the VM (~45 s)
+python3 scripts/devbridge.py reload        # copy edited source + hot-reload (~35 s)
+python3 scripts/devbridge.py key "w 1500"  # send input
+python3 scripts/devbridge.py shot          # screenshot + parsed HUD
+python3 scripts/devbridge.py stop
 ```
 
 How it works:
 
 * The dev ISO's `Once.HC.Z` runs a supervisor that scans drives for
   `MCRAFT.HC` (it finds `C:`), then waits for `C:/RELOAD`.
-* `devbridge.py` injects a small dev-only hook into a **copy** of the source
+* `scripts/devbridge.py` injects a small dev-only hook into a **copy** of the source
   that polls for `C:/RELOAD` and exits the game; `MCRAFT.HC` itself stays
   clean. `DskChg` invalidates TempleOS's disk cache so host-side writes are
   visible.
@@ -172,10 +188,10 @@ How it works:
   compile in this TempleOS build.
 * The supervisor calls `MountIDEAuto` and `DskChg`, then recompiles the new
   source with `ExeFile` inside a `try`/`catch`.
-* `holyc_lint.py` catches HolyC pitfalls before booting (`eps` macro
+* `scripts/holyc_lint.py` catches HolyC pitfalls before booting (`eps` macro
   collisions, bare `tS`, `?:`, `continue`, function-like macros). Run it after
-  every edit: `python3 holyc_lint.py`.
-* `glyph_ocr.py` reads the HUD from fixed 8-pixel TempleOS glyph cells using
+  every edit: `python3 scripts/holyc_lint.py`.
+* `scripts/glyph_ocr.py` reads the HUD from fixed 8-pixel TempleOS glyph cells using
   exact bitmaps in `holyc_font.json`, so fps and coordinates can be checked
   without looking at the image.
 
@@ -184,7 +200,7 @@ parses partition entries and will not find a bare superfloppy. `make-fat-image.s
 creates a 1 MiB-aligned FAT32 partition at offset 1048576; host tools use the
 `fat.img@@1048576` mtools suffix.
 
-`qctl.py` uses QEMU's HMP monitor at `/tmp/opencode/qdev.sock`; mouse buttons
+`scripts/qctl.py` uses QEMU's HMP monitor at `/tmp/opencode/qdev.sock`; mouse buttons
 are numeric (`mouse_button 1` = press left, `0` = release).
 
 The layered build does **not** use the hot-reload loop: in-game `DskChg` polling
@@ -226,24 +242,24 @@ lerp the quotients across the span) was rebuilt and captured at the identical
 spawn pose: 10.8% of all pixels differ from the per-pixel build — the spatial
 texel drift behind the reported morphing. The per-pixel reciprocal divide
 costs about 1-2 FPS versus that affine loop.
-`gpu_hud.py` reads this HUD with the same exact-bitmap approach as
-`glyph_ocr.py`, but for the inline 5x7 font.
+`scripts/gpu_hud.py` reads this HUD with the same exact-bitmap approach as
+`scripts/glyph_ocr.py`, but for the inline 5x7 font.
 
 Reproduce with:
 
 ```bash
-python3 runtest.py check 85          # fresh boot + screenshot after 85s
-python3 qctl.py key "w 1500"         # hold W
-python3 qctl.py cmd "mouse_button 1" # press left button
-python3 qctl.py cmd "mouse_button 0" # release
-python3 qctl.py shot check2
+python3 scripts/runtest.py check 85          # fresh boot + screenshot after 85s
+python3 scripts/qctl.py key "w 1500"         # hold W
+python3 scripts/qctl.py cmd "mouse_button 1" # press left button
+python3 scripts/qctl.py cmd "mouse_button 0" # release
+python3 scripts/qctl.py shot check2
 
-HOLYCRAFT_ISO=$PWD/TempleOS-HolyCraft-GPU.ISO python3 runtest.py gpu_check 120
-python3 gpu_hud.py /tmp/opencode/gpu_check.png
+HOLYCRAFT_ISO=$PWD/TempleOS-HolyCraft-GPU.ISO python3 scripts/runtest.py gpu_check 120
+python3 scripts/gpu_hud.py /tmp/opencode/gpu_check.png
 
 HOLYCRAFT_ISO=$PWD/TempleOS-HolyCraft-GPU.ISO HOLYCRAFT_VGA=cirrus \
-python3 runtest.py gpu_fallback_check 120
-python3 gpu_hud.py /tmp/opencode/gpu_fallback_check.png
+python3 scripts/runtest.py gpu_fallback_check 120
+python3 scripts/gpu_hud.py /tmp/opencode/gpu_fallback_check.png
 ```
 
 ## Notes / limitations

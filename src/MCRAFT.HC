@@ -38,8 +38,13 @@
 #define MC_SEA          13              // sea level
 
 #define MC_RENDER_DIST  13              // blocks around player to render
-#define MC_FOG_START    (MC_RENDER_DIST * 0.45)
-#define MC_FOG_END      (MC_RENDER_DIST * 0.95)
+// Fog boundaries as plain literals: hcc miscompiles constant arithmetic
+// like (MC_RENDER_DIST * 0.95) in typed contexts.  The GPU generator
+// rewrites these for its 9-block view (4.05 / 8.55 / 8.721 / 4.5).
+#define MC_FOG_START    5.85            // MC_RENDER_DIST * 0.45
+#define MC_FOG_END      12.35           // MC_RENDER_DIST * 0.95
+#define MC_FOG_CULL     12.597          // MC_FOG_END * 1.02
+#define MC_FOG_SPAN     6.5             // MC_FOG_END - MC_FOG_START
 #define MC_FOCAL        450.0           // projection focal length in pixels
 
 #define MC_GRAVITY      32.0            // Java Edition: -0.08 blocks/tick^2
@@ -93,6 +98,23 @@
 #define MC_SC_5         0x06
 #define MC_SC_6         0x07
 #define MC_SC_SPACE     0x39
+
+
+
+
+// hcc already knows Bool; TempleOS has it built in.
+// Note: the game deliberately does not touch Fs->win_inhibit — the TempleOS
+// task default already matches WIG_TASK_DFT, and hcc's compiler cannot
+// parse that member access (it walks even disabled branches and its error
+// formatter crashes on the property check).
+
+#ifdef __HCC__
+#include "compat_hcc.HC"
+#endif
+
+
+
+
 
 class CBlockInfo {
   U8 *name;
@@ -869,7 +891,7 @@ Bool EmitFace(I64 bx, I64 by, I64 bz, I64 dir)
     depth += oz[i];
   }
   depth /= nv;
-  if (depth > MC_FOG_END * 1.02) return FALSE;          // fully fogged
+  if (depth > MC_FOG_CULL) return FALSE;                // fully fogged
   xmin = xmax = fxs[fcount * 5];
   ymin = ymax = fys[fcount * 5];
   for (i = 1; i < nv; i++) {
@@ -881,7 +903,7 @@ Bool EmitFace(I64 bx, I64 by, I64 bz, I64 dir)
     return FALSE;                                       // off screen
   // shading + fog thresholds
   st = face_light[dir] * 15;
-  fogt = FClamp((depth - MC_FOG_START) / (MC_FOG_END - MC_FOG_START), 0.0, 1.0);
+  fogt = FClamp((depth - MC_FOG_START) / MC_FOG_SPAN, 0.0, 1.0);
   fi = fcount;
   fnverts[fi] = nv;
   fshadeT[fi] = st;
@@ -1138,17 +1160,64 @@ F64 NowSecs()
   return tS();
 }
 
+// Main-loop state, shared with GameFrame so the loop body can live in its
+// own function (hcc's transpiler cannot handle try/catch around the loop).
+Bool quit;
+I64 fps, frames;
+F64 t0, fps_t, phys_acc;
+
+U0 GameFrame()
+{
+  I64 x, y, u, bx, by, bz;
+  F64 t1, dt;
+  Bool underwater;
+  t1 = NowSecs();
+  dt = t1 - t0;
+  t0 = t1;
+  if (dt < 0.0001) dt = 0.0001;
+  if (dt > 0.1)    dt = 0.1;
+  last_dt = dt;
+  if (kbd.scan_code == SC_ESC) quit = TRUE;
+  HandleInput;
+  phys_acc += dt;
+  if (phys_acc > 0.1) phys_acc = 0.1;   // don't spiral after a stall
+  while (phys_acc >= MC_STEP_TIME) {
+    UpdatePlayer(MC_STEP_TIME);
+    phys_acc -= MC_STEP_TIME;
+  }
+  UpdateCamera;
+  scr_w = gr.dc->width;
+  scr_h = gr.dc->height;
+  BuildFaceList;
+  DrawSky;
+  DrawWorld;
+  bx = P.x; by = P.y + MC_EYE; bz = P.z;
+  underwater = GetBlock(bx, by, bz) == B_WATER;
+  if (underwater)
+    for (y = 0; y < scr_h; y++)
+      for (x = 0; x < scr_w; x++)
+        if (bayer[(x & 3) + ((y & 3) << 2)] < 10.0) db[y * stride + x] = BLUE;
+        else db[y * stride + x] = LTBLUE;
+  frames++;
+  if (t1 - fps_t >= 1.0) {
+    fps = frames / (t1 - fps_t);
+    frames = 0;
+    fps_t = t1;
+  }
+  DrawHud(fps);
+  Sleep(5);
+}
+
 U0 HolyCraft()
 {
-  Bool quit = FALSE, underwater;
-  I64 fps = 0, frames = 0, x, y, u, bx, by, bz;
-  F64 t0, t1, dt, fps_t, phys_acc;
   SettingsPush;
-  Fs->win_inhibit = WIG_TASK_DFT;
   WinMax;
   DocCursor;
   DocClear;
   FlushMsgs;
+  #ifdef __HCC__
+  InitHCCCompat;
+  #endif
   InitBlocks;
   InitRendererTables;
   GenWorld;
@@ -1160,53 +1229,22 @@ U0 HolyCraft()
   scr_w = gr.dc->width;
   scr_h = gr.dc->height;
   t0 = NowSecs();  fps_t = t0;  phys_acc = 0.0;
+  fps = 0;  frames = 0;  quit = FALSE;
+  #ifdef __HCC__
+  while (!quit) GameFrame;
+  #else
   try {
-    while (!quit) {
-      t1 = NowSecs();
-      dt = t1 - t0;
-      t0 = t1;
-      if (dt < 0.0001) dt = 0.0001;
-      if (dt > 0.1)    dt = 0.1;
-      last_dt = dt;
-      if (kbd.scan_code == SC_ESC) quit = TRUE;
-      HandleInput;
-      phys_acc += dt;
-      if (phys_acc > 0.1) phys_acc = 0.1;   // don't spiral after a stall
-      while (phys_acc >= MC_STEP_TIME) {
-        UpdatePlayer(MC_STEP_TIME);
-        phys_acc -= MC_STEP_TIME;
-      }
-      UpdateCamera;
-      scr_w = gr.dc->width;
-      scr_h = gr.dc->height;
-      BuildFaceList;
-      DrawSky;
-      DrawWorld;
-      bx = P.x; by = P.y + MC_EYE; bz = P.z;
-      underwater = GetBlock(bx, by, bz) == B_WATER;
-      if (underwater)
-        for (y = 0; y < scr_h; y++)
-          for (x = 0; x < scr_w; x++)
-            if (bayer[(x & 3) + ((y & 3) << 2)] < 10.0) db[y * stride + x] = BLUE;
-            else db[y * stride + x] = LTBLUE;
-      frames++;
-      if (t1 - fps_t >= 1.0) {
-        fps = frames / (t1 - fps_t);
-        frames = 0;
-        fps_t = t1;
-      }
-      DrawHud(fps);
-      Sleep(5);
-    }
+    while (!quit) GameFrame;
   } catch {
     PutExcept;
     quit = TRUE;
   }
+  #endif
   FlushMsgs;
   SettingsPop;
   DocClear;
-  Print("HolyCraft closed.\n"
-        "$FG,LTGREEN$Run it again by including MCRAFT.HC.$FG$\n");
+  Print("HolyCraft closed.\n");
+  Print("$FG,LTGREEN$Run it again by including MCRAFT.HC.$FG$\n");
 }
 
 HolyCraft;

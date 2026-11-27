@@ -11,7 +11,7 @@ rm -f "$IMG"
 truncate -s 64M "$IMG"
 parted -s "$IMG" mklabel msdos mkpart primary fat32 1MiB 100% >/dev/null
 mformat -i "$IMG@@$OFF" -F -v TEMPLE :: >/dev/null
-mcopy -i "$IMG@@$OFF" MCRAFT.HC ::/MCRAFT.HC
+mcopy -i "$IMG@@$OFF" src/MCRAFT.HC ::/MCRAFT.HC
 echo "Partition offset: $OFF bytes (sector 2048)"
 mdir -i "$IMG@@$OFF" ::/
 echo "fat.img ready."
