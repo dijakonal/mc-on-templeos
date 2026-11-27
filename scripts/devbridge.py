@@ -30,7 +30,7 @@ sys.path.insert(0, BASE)
 import qctl
 import glyph_ocr
 
-HOOK_OLD = '      if (kbd.scan_code == SC_ESC) quit = TRUE;'
+HOOK_OLD = '  if (kbd.scan_code == SC_ESC) quit = TRUE;'
 HOOK_NEW = HOOK_OLD + '''
       if (!(frames & 31)) {
         DskChg;

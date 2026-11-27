@@ -55,6 +55,8 @@
 #define MC_SWIM_SPEED   2.6
 #define MC_TERMINAL_VY  48.0
 #define MC_STEP_TIME    (1.0 / 30.0)    // physics substep, decoupled from FPS
+#define MC_DAY_LENGTH   1200.0          // full day+night cycle, 20 min like Minecraft
+#define MC_SNEAK_SPEED  1.3             // Java Edition sneak speed
 #define MC_HALF         0.30            // player half-width
 #define MC_HEIGHT       1.80            // player height
 #define MC_EYE          1.62            // eye height above feet
@@ -75,7 +77,8 @@
 #define B_GRAVEL        10
 #define B_COAL_ORE      11
 #define B_IRON_ORE      12
-#define B_COUNT         13
+#define B_COBBLE        13
+#define B_COUNT         14
 
 // ---- face dirs ----
 #define D_POSX  0
@@ -91,6 +94,7 @@
 #define MC_SC_S         0x1F
 #define MC_SC_D         0x20
 #define MC_SC_F         0x21
+#define MC_SC_CTRL      0x1D
 #define MC_SC_1         0x02
 #define MC_SC_2         0x03
 #define MC_SC_3         0x04
@@ -103,7 +107,7 @@
 
 
 // hcc already knows Bool; TempleOS has it built in.
-// Note: the game deliberately does not touch Fs->win_inhibit — the TempleOS
+// Note: the game deliberately does not touch Fs->win_inhibit (the TempleOS
 // task default already matches WIG_TASK_DFT, and hcc's compiler cannot
 // parse that member access (it walks even disabled branches and its error
 // formatter crashes on the property check).
@@ -135,7 +139,35 @@ U8 world[MC_WORLD_SX * MC_WORLD_SZ * MC_WORLD_SY];
 U8 colmax[MC_WORLD_SX * MC_WORLD_SZ];   // top solid block + 1, per column
 
 I64 hotbar_items[6];
+I64 hotbar_count[6];
 I64 hotbar_sel;
+
+// ---- day/night cycle ------------------------------------------------------
+// day_time runs 0..1 over MC_DAY_LENGTH seconds: 0 = dawn, 0.25 = noon,
+// 0.5 = dusk, 0.75 = midnight.  day_light is 0..1 and drives the sky,
+// fog and (GPU build) face brightness.
+F64 day_time;
+F64 day_light;
+
+// ---- mining ----------------------------------------------------------------
+F64  blk_hard[B_COUNT];                // seconds to break, -1 = unmineable
+I64  mine_hx, mine_hy, mine_hz;        // block being mined
+I64  mine_face, last_hx, last_hy, last_hz;
+F64  mine_progress;                    // seconds accumulated on it
+Bool mining;
+
+// ---- falling blocks (sand / gravel) ---------------------------------------
+I64 fall_x[64], fall_y[64], fall_z[64];
+I64 fall_n;
+
+// ---- main-loop state -------------------------------------------------------
+// Shared with GameFrame so the loop body can live in its own function
+// (hcc's transpiler cannot handle try/catch around the loop), and used by
+// the cloud layer for its drift clock.  Declared early: HolyC has no
+// forward references.
+Bool quit;
+I64 fps, frames;
+F64 t0, fps_t, phys_acc;
 
 // ---- tiny math helpers (named to avoid clobbering TempleOS builtins) ----
 I64 IAbs(I64 v)
@@ -274,15 +306,64 @@ U0 RecalcCol(I64 x, I64 z)
   colmax[x + z * MC_WORLD_SX] = y + 1;
 }
 
+U0 EnqueueFall(I64 x, I64 y, I64 z)
+{
+  if (fall_n >= 64) return;
+  fall_x[fall_n] = x;  fall_y[fall_n] = y;  fall_z[fall_n] = z;
+  fall_n++;
+}
+
 U0 SetBlockUpdate(I64 x, I64 y, I64 z, I64 b)
 {
+  I64 ab;
   SetBlockRaw(x, y, z, b);
   if (x >= 0 && x < MC_WORLD_SX && z >= 0 && z < MC_WORLD_SZ)
     RecalcCol(x, z);
+  // Gravity blocks: what we just changed and what sits on top of it may
+  // need to start falling.
+  if (y + 1 < MC_WORLD_SY) {
+    ab = GetBlock(x, y + 1, z);
+    if (ab == B_SAND || ab == B_GRAVEL) EnqueueFall(x, y + 1, z);
+  }
+}
+
+// Gravity blocks sink one cell per frame, like Minecraft's falling sand.
+U0 ProcessFalls()
+{
+  I64 i, o, n0, b, below, x, y, z;
+  n0 = fall_n;                          // entries appended below wait a frame
+  o = 0;
+  for (i = 0; i < n0; i++) {
+    x = fall_x[i];  y = fall_y[i];  z = fall_z[i];
+    b = GetBlock(x, y, z);
+    if (b == B_SAND || b == B_GRAVEL) {
+      below = GetBlock(x, y - 1, z);
+      if (below == B_AIR || below == B_WATER) {
+        SetBlockUpdate(x, y, z, B_AIR);
+        SetBlockUpdate(x, y - 1, z, b);
+        if (y > 1) EnqueueFall(x, y - 1, z);   // keep sinking next frame
+        EnqueueFall(x, y + 1, z);              // the block above may follow
+      }
+    }
+  }
+  // Compact: keep only entries that still need to fall (this re-check also
+  // covers the entries appended during the pass).
+  for (i = 0; i < fall_n; i++) {
+    b = GetBlock(fall_x[i], fall_y[i], fall_z[i]);
+    if (b == B_SAND || b == B_GRAVEL) {
+      below = GetBlock(fall_x[i], fall_y[i] - 1, fall_z[i]);
+      if (below == B_AIR || below == B_WATER) {
+        fall_x[o] = fall_x[i];  fall_y[o] = fall_y[i];  fall_z[o] = fall_z[i];
+        o++;
+      }
+    }
+  }
+  fall_n = o;
 }
 
 U0 InitBlocks()
 {
+  I64 i;
   blkinfo[B_AIR].name = "Air";
   blkinfo[B_AIR].solid = FALSE;    blkinfo[B_AIR].targetable = FALSE;
 
@@ -358,12 +439,35 @@ U0 InitBlocks()
   blkinfo[B_IRON_ORE].bot_a  = BROWN;  blkinfo[B_IRON_ORE].bot_b  = DKGRAY;
   blkinfo[B_IRON_ORE].solid = TRUE;    blkinfo[B_IRON_ORE].targetable = TRUE;
 
-  hotbar_items[0] = B_GRASS;
-  hotbar_items[1] = B_DIRT;
-  hotbar_items[2] = B_STONE;
-  hotbar_items[3] = B_SAND;
-  hotbar_items[4] = B_WOOD;
-  hotbar_items[5] = B_LEAVES;
+  blkinfo[B_COBBLE].name = "Cobblestone";
+  blkinfo[B_COBBLE].top_a  = LTGRAY; blkinfo[B_COBBLE].top_b  = DKGRAY;
+  blkinfo[B_COBBLE].side_a = DKGRAY; blkinfo[B_COBBLE].side_b = LTGRAY;
+  blkinfo[B_COBBLE].bot_a  = DKGRAY; blkinfo[B_COBBLE].bot_b  = BLACK;
+  blkinfo[B_COBBLE].solid = TRUE;    blkinfo[B_COBBLE].targetable = TRUE;
+
+  // Seconds of continuous mining to break each block by hand, tuned for
+  // playability (Minecraft's bare-hand times are much longer).  -1 = not
+  // mineable.
+  blk_hard[B_GRASS]   = 0.45;
+  blk_hard[B_DIRT]    = 0.40;
+  blk_hard[B_STONE]   = 1.10;
+  blk_hard[B_COBBLE]  = 1.10;
+  blk_hard[B_SAND]    = 0.35;
+  blk_hard[B_GRAVEL]  = 0.40;
+  blk_hard[B_SNOW]    = 0.25;
+  blk_hard[B_WOOD]    = 0.80;
+  blk_hard[B_LEAVES]  = 0.20;
+  blk_hard[B_COAL_ORE]  = 1.40;
+  blk_hard[B_IRON_ORE]  = 1.60;
+  blk_hard[B_BEDROCK] = -1.0;
+  blk_hard[B_WATER]   = -1.0;
+  blk_hard[B_AIR]     = -1.0;
+
+  // Survival start: empty inventory, punch trees for wood.
+  for (i = 0; i < 6; i++) {
+    hotbar_items[i]  = 0;
+    hotbar_count[i]  = 0;
+  }
   hotbar_sel      = 0;
 }
 
@@ -586,7 +690,7 @@ U0 UpdatePlayer(F64 dt)
 {
   F64 fwd_x, fwd_z, rgt_x, rgt_z, mx, mz, spd, k, accel;
   I64 wbx, wby, wbz;
-  Bool in_water, sprint;
+  Bool in_water, sprint, sneak;
   mx = 0; mz = 0;
   fwd_x = Sin(P.yaw);  fwd_z = Cos(P.yaw);
   rgt_x = Cos(P.yaw);  rgt_z = -Sin(P.yaw);
@@ -597,9 +701,13 @@ U0 UpdatePlayer(F64 dt)
   wbx = P.x; wby = P.y + 0.4; wbz = P.z;
   in_water = GetBlock(wbx, wby, wbz) == B_WATER ||
              GetBlock(P.x, P.y + MC_EYE, P.z) == B_WATER;
-  sprint = Bt(kbd.down_bitmap, SC_SHIFT) && !P.flying && !in_water;
+  // Minecraft controls: Ctrl sprints, Shift sneaks (Shift still descends
+  // while flying).
+  sprint = Bt(kbd.down_bitmap, MC_SC_CTRL) && !P.flying && !in_water;
+  sneak = Bt(kbd.down_bitmap, SC_SHIFT) && P.on_ground && !P.flying && !in_water;
   if (P.flying) spd = MC_FLY_SPEED;
   else if (sprint) spd = MC_SPRINT_SPEED;
+  else if (sneak) spd = MC_SNEAK_SPEED;
   else if (in_water) spd = MC_SWIM_SPEED;
   else spd = MC_WALK_SPEED;
   if (mx != 0.0 || mz != 0.0) {
@@ -909,6 +1017,12 @@ Bool EmitFace(I64 bx, I64 by, I64 bz, I64 dir)
   return TRUE;
 }
 
+// Clouds: a no-op in the 16-color build; the GPU generator replaces this
+// stub with translucent quads drifting at cloud height.
+U0 EmitClouds()
+{
+}
+
 U0 BuildFaceList()
 {
   I64 px, pz, x, z, y, ymax, b, dir, nb, i, buck, nx, ny, nz;
@@ -944,6 +1058,7 @@ U0 BuildFaceList()
     }
   }
   // painter's algorithm: bucket sort far -> near
+  EmitClouds;
   invspan = 1.0 / (MC_FOG_END - MC_NEAR);
   for (i = 0; i < 256; i++) bhead[i] = -1;
   for (i = 0; i < fcount; i++) {
@@ -963,41 +1078,135 @@ U0 DrawWorld()
 
 // =============================== SKY / HUD ===============================
 
+U0 DrawSkyBody(F64 dx, F64 dy, F64 dz, I64 radius, U8 core, U8 ring)
+{
+  // Project a celestial body direction and stamp a dithered disc.
+  F64 sx, sy, u, v, t, cz, px, py;
+  I64 x, y;
+  px = dx * cam_rx + dy * cam_ry + dz * cam_rz;
+  py = dx * cam_ux + dy * cam_uy + dz * cam_uz;
+  cz = dx * cam_fx + dy * cam_fy + dz * cam_fz;
+  if (cz < 0.1) return;
+  sx = scr_w * 0.5 + px * MC_FOCAL / cz;
+  sy = scr_h * 0.5 - py * MC_FOCAL / cz;
+  for (v = -radius - 4; v <= radius + 4; v++)
+    for (u = -radius - 4; u <= radius + 4; u++) {
+      x = ToI64(sx) + u;  y = ToI64(sy) + v;
+      if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
+        t = Sqrt(u * u + v * v);
+        if (t < radius) db[y * stride + x] = core;
+        else if (t < radius + 3 && bayer[(x & 3) + ((y & 3) << 2)] < 9.0)
+          db[y * stride + x] = ring;
+      }
+    }
+}
+
 U0 DrawSky()
 {
-  F64 sx, sy, u, v, t, cz;
-  I64 y, row, x, horizon;
+  F64 u, v, t, cz, a, dx, dy, dz;
+  I64 y, row, x, horizon, i, hx, hy, lightv;
   // horizon = where eye-level rays hit the screen (rises as you look down)
   horizon = scr_h * 0.5 + Sin(P.pitch) / Cos(P.pitch) * MC_FOCAL;
   horizon = IClamp(horizon, -scr_h, 2 * scr_h);
+  lightv = ToI64(day_light * 16.0);
   for (y = 0; y < scr_h; y++) {
     row = y * stride;
-    if (y < horizon - 4)
-      MemSet(db + row, LTBLUE, scr_w);
-    else if (y <= horizon + 4)
-      // dithered haze band at the horizon
-      for (x = 0; x < scr_w; x++) {
-        if (bayer[(x & 3) + ((y & 3) << 2)] < 8.0) db[row + x] = LTBLUE;
-        else db[row + x] = CYAN;
-      }
-    else
-      MemSet(db + row, CYAN, scr_w);
+    // Day/night: dither the day and night palettes per row by the light
+    // level, so dusk and dawn sweep across the sky.
+    if (bayer[0 + ((y & 3) << 2)] < lightv) {
+      if (y < horizon - 4)
+        MemSet(db + row, BLUE, scr_w);
+      else if (y <= horizon + 4)
+        for (x = 0; x < scr_w; x++) {
+          if (bayer[(x & 3) + ((y & 3) << 2)] < 8.0) db[row + x] = BLUE;
+          else db[row + x] = BLACK;
+        }
+      else
+        MemSet(db + row, BLACK, scr_w);
+    } else {
+      if (y < horizon - 4)
+        MemSet(db + row, LTBLUE, scr_w);
+      else if (y <= horizon + 4)
+        // dithered haze band at the horizon
+        for (x = 0; x < scr_w; x++) {
+          if (bayer[(x & 3) + ((y & 3) << 2)] < 8.0) db[row + x] = LTBLUE;
+          else db[row + x] = CYAN;
+        }
+      else
+        MemSet(db + row, CYAN, scr_w);
+    }
   }
-  // sun
-  cz = 0.45 * cam_fx + 0.75 * cam_fy + 0.45 * cam_fz;
-  if (cz > 0.1) {
-    sx = scr_w * 0.5 + (0.45 * cam_rx + 0.75 * cam_ry + 0.45 * cam_rz) * MC_FOCAL / cz;
-    sy = scr_h * 0.5 - (0.45 * cam_ux + 0.75 * cam_uy + 0.45 * cam_uz) * MC_FOCAL / cz;
-    for (v = -10; v <= 10; v++)
-      for (u = -10; u <= 10; u++) {
-        x = sx + u; y = sy + v;
-        if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
-          t = Sqrt(u * u + v * v);
-          if (t < 6.0) db[y * stride + x] = YELLOW;
-          else if (bayer[(x & 3) + ((y & 3) << 2)] < 9.0) db[y * stride + x] = YELLOW;
-          else db[y * stride + x] = LTBLUE;
+  // stars: fixed hashed positions, visible at night
+  if (day_light < 0.45) {
+    i = horizon - 8;
+    if (i < 4) i = 4;
+    for (y = 0; y < 48; y++) {
+      hx = Hash2i(y * 7 + 1, 31) % (scr_w - 2) + 1;
+      hy = Hash2i(y * 13 + 5, 17) % i;
+      if (bayer[(hx & 3) + ((hy & 3) << 2)] < 12.0 - day_light * 24.0)
+        db[hy * stride + hx] = WHITE;
+    }
+  }
+  // sun and moon ride opposite ends of the same rotating arc: noon is
+  // day_time 0.25, midnight 0.75
+  a = day_time * 6.2832;
+  dx = Cos(a) * 0.85;
+  dy = Sin(a);
+  dz = 0.35;
+  if (dy > -0.15) DrawSkyBody(dx, dy, dz, 6, YELLOW, YELLOW);
+  if (-dy > -0.15) DrawSkyBody(-dx, -dy, -dz, 5, WHITE, LTGRAY);
+}
+
+U0 DrawCrackOverlay()
+{
+  // Darkening dither over the block being mined; the density grows with
+  // the progress so it reads as cracks spreading over the block.
+  F64 vx[8], vy[8], vz[8], cx, cy, cz, sxx[8], syy[8], frac, t, ya, yb, xa, xb, xl, xr;
+  I64 i, j, f, k, stage, x, y, x0, x1, y0, y1, row, c[4];
+  if (!mining || mine_progress <= 0.0) return;
+  frac = mine_progress / blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]];
+  frac = FClamp(frac, 0.0, 0.999);
+  stage = ToI64(frac * 8.0) + 1;
+  for (i = 0; i < 8; i++) {
+    vx[i] = mine_hx + corn_x[i] - cam_ex;
+    vy[i] = mine_hy + corn_y[i] - cam_ey;
+    vz[i] = mine_hz + corn_z[i] - cam_ez;
+    cz = vx[i] * cam_fx + vy[i] * cam_fy + vz[i] * cam_fz;
+    if (cz < MC_NEAR) return;           // only when fully visible
+    cx = vx[i] * cam_rx + vy[i] * cam_ry + vz[i] * cam_rz;
+    cy = vx[i] * cam_ux + vy[i] * cam_uy + vz[i] * cam_uz;
+    sxx[i] = scr_w * 0.5 + cx * MC_FOCAL / cz;
+    syy[i] = scr_h * 0.5 - cy * MC_FOCAL / cz;
+  }
+  for (f = 0; f < 6; f++) {
+    for (k = 0; k < 4; k++) c[k] = face_corners[f][k];
+    y0 = scr_h;  y1 = 0;
+    for (k = 0; k < 4; k++) {
+      if (ToI64(syy[c[k]]) < y0) y0 = ToI64(syy[c[k]]);
+      if (ToI64(syy[c[k]]) > y1) y1 = ToI64(syy[c[k]]);
+    }
+    y0 = IClamp(y0, 0, scr_h - 1);
+    y1 = IClamp(y1, 0, scr_h - 1);
+    for (y = y0; y <= y1; y++) {
+      xl = 1e9;  xr = -1e9;
+      for (j = 0; j < 4; j++) {
+        k = (j + 1) & 3;
+        ya = syy[c[j]];  yb = syy[c[k]];
+        if (ya != yb && ((y >= ya && y < yb) || (y >= yb && y < ya))) {
+          t = (y - ya) / (yb - ya);
+          xa = sxx[c[j]] + (sxx[c[k]] - sxx[c[j]]) * t;
+          if (xa < xl) xl = xa;
+          if (xa > xr) xr = xa;
         }
       }
+      if (xr >= xl) {
+        x0 = IClamp(ToI64(Ceil(xl)), 0, scr_w - 1);
+        x1 = IClamp(ToI64(Floor(xr)), 0, scr_w - 1);
+        row = y * stride;
+        for (x = x0; x <= x1; x++)
+          if (bayer[(x & 3) + ((y & 3) << 2)] < stage) db[row + x] = BLACK;
+      }
+    }
   }
 }
 
@@ -1065,11 +1274,41 @@ U0 DrawHotbar()
         if (y == 0 || y == 23 || x == 0 || x == 23 || y == 3 || x == 3) {
           if (i == hotbar_sel) db[(scr_h - 30 + y) * stride + (x0 + i * 30 + x)] = WHITE;
           else db[(scr_h - 30 + y) * stride + (x0 + i * 30 + x)] = DKGRAY;
-        } else {
+        } else if (hotbar_count[i] > 0) {
           db[(scr_h - 30 + y) * stride + (x0 + i * 30 + x)] = blkinfo[b].side_a;
+        } else {
+          db[(scr_h - 30 + y) * stride + (x0 + i * 30 + x)] = BLACK;
         }
       }
+    // stack count, like Minecraft's slot counters
+    if (hotbar_count[i] > 0) {
+      gr.dc->color = WHITE;
+      GrPrint(gr.dc, x0 + i * 30 + 8, scr_h - 10, "%d", hotbar_count[i]);
+    }
   }
+}
+
+U0 DrawMineBar()
+{
+  // Little progress bar under the crosshair while mining.
+  I64 cx, cy, i, n, y;
+  F64 frac;
+  if (!mining || mine_progress <= 0.0) return;
+  frac = mine_progress / blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]];
+  frac = FClamp(frac, 0.0, 1.0);
+  cx = scr_w / 2;  cy = scr_h / 2 + 10;
+  for (i = -20; i <= 20; i++) {
+    db[cy * stride + cx + i] = BLACK;
+    db[(cy + 4) * stride + cx + i] = BLACK;
+  }
+  for (i = -4; i <= 4; i++) {
+    db[(cy + i) * stride + cx - 20] = BLACK;
+    db[(cy + i) * stride + cx + 20] = BLACK;
+  }
+  n = ToI64(frac * 38.0);
+  for (i = -19; i < -19 + n; i++)
+    for (y = -3; y <= 3; y++)
+      db[(cy + y) * stride + cx + i] = WHITE;
 }
 
 U0 DrawHud(I64 fps)
@@ -1089,6 +1328,7 @@ U0 DrawHud(I64 fps)
     GrPrint(gr.dc, scr_w - 120, 4, "%s", blkinfo[world[WIdx(hitx, hity, hitz)]].name);
     DrawBoxWire(hitx, hity, hitz, WHITE);
   }
+  DrawMineBar;
   DrawHotbar;
   DrawCrosshair();
 }
@@ -1099,12 +1339,44 @@ F64  last_dt;
 Bool prev_lb, prev_rb, prev_f;
 F64  last_mx, last_my;
 
+// Which item a broken block yields, Minecraft-style: grass drops dirt and
+// stone drops cobblestone; leaves and bedrock drop nothing.  -1 = no drop.
+I64 BlockDrop(I64 b)
+{
+  if (b == B_GRASS) return B_DIRT;
+  if (b == B_STONE) return B_COBBLE;
+  if (b == B_LEAVES) return -1;
+  if (b == B_BEDROCK) return -1;
+  return b;
+}
+
+U0 CollectDrop(I64 b)
+{
+  I64 i;
+  for (i = 0; i < 6; i++) {
+    if (hotbar_items[i] == b && hotbar_count[i] < 64) {
+      hotbar_count[i]++;
+      return;
+    }
+  }
+  for (i = 0; i < 6; i++) {
+    if (hotbar_count[i] == 0) {
+      hotbar_items[i] = b;
+      hotbar_count[i] = 1;
+      return;
+    }
+  }
+  // inventory full: the drop is lost
+}
+
 U0 BreakOrPlace(Bool place)
 {
-  I64 hitx, hity, hitz, hitface, tx, ty, tz, b;
+  I64 hitx, hity, hitz, hitface, tx, ty, tz, b, drop;
   if (!Raycast(&hitx, &hity, &hitz, &hitface))
     return;
   if (place) {
+    // need something in the selected slot
+    if (hotbar_count[hotbar_sel] <= 0) return;
     tx = hitx + (hitface == D_POSX) - (hitface == D_NEGX);
     ty = hity + (hitface == D_POSY) - (hitface == D_NEGY);
     tz = hitz + (hitface == D_POSZ) - (hitface == D_NEGZ);
@@ -1114,9 +1386,13 @@ U0 BreakOrPlace(Bool place)
     if (P.x + MC_HALF > tx && P.x - MC_HALF < tx + 1 && P.y + MC_HEIGHT > ty && P.y < ty + 1 && P.z + MC_HALF > tz && P.z - MC_HALF < tz + 1)
       return;
     SetBlockUpdate(tx, ty, tz, hotbar_items[hotbar_sel]);
+    hotbar_count[hotbar_sel]--;
   } else {
-    if (world[WIdx(hitx, hity, hitz)] == B_BEDROCK) return;
+    b = world[WIdx(hitx, hity, hitz)];
+    if (b == B_BEDROCK) return;
     SetBlockUpdate(hitx, hity, hitz, B_AIR);
+    drop = BlockDrop(b);
+    if (drop >= 0) CollectDrop(drop);
   }
 }
 
@@ -1145,7 +1421,31 @@ U0 HandleInput()
     P.flying = !P.flying;
   prev_f = Bt(kbd.down_bitmap, MC_SC_F);
   // mouse buttons
-  if (ms.lb && !prev_lb) BreakOrPlace(FALSE);
+  // Hold the left button to mine the targeted block; progress resets when
+  // the target changes or the button is released (Minecraft behaviour).
+  if (ms.lb) {
+    if (Raycast(&mine_hx, &mine_hy, &mine_hz, &mine_face)) {
+      if (!mining || mine_hx != last_hx || mine_hy != last_hy || mine_hz != last_hz) {
+        mining = TRUE;
+        mine_progress = 0.0;
+        last_hx = mine_hx;  last_hy = mine_hy;  last_hz = mine_hz;
+      }
+      if (blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]] >= 0.0) {
+        mine_progress += last_dt;
+        if (mine_progress >= blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]]) {
+          mining = FALSE;
+          mine_progress = 0.0;
+          BreakOrPlace(FALSE);
+        }
+      }
+    } else {
+      mining = FALSE;
+      mine_progress = 0.0;
+    }
+  } else {
+    mining = FALSE;
+    mine_progress = 0.0;
+  }
   if (ms.rb && !prev_rb) BreakOrPlace(TRUE);
   prev_lb = ms.lb;
   prev_rb = ms.rb;
@@ -1156,11 +1456,7 @@ F64 NowSecs()
   return tS();
 }
 
-// Main-loop state, shared with GameFrame so the loop body can live in its
-// own function (hcc's transpiler cannot handle try/catch around the loop).
-Bool quit;
-I64 fps, frames;
-F64 t0, fps_t, phys_acc;
+// Main-loop state lives near the top of the file (used by EmitClouds).
 
 U0 GameFrame()
 {
@@ -1181,6 +1477,11 @@ U0 GameFrame()
     UpdatePlayer(MC_STEP_TIME);
     phys_acc -= MC_STEP_TIME;
   }
+  ProcessFalls;
+  // Day/night clock: 0 = dawn, 0.25 = noon, 0.5 = dusk, 0.75 = midnight.
+  day_time += dt / MC_DAY_LENGTH;
+  if (day_time >= 1.0) day_time -= 1.0;
+  day_light = FClamp(Sin(day_time * 6.2832) * 3.0 + 0.5, 0.0, 1.0);
   UpdateCamera;
   scr_w = gr.dc->width;
   scr_h = gr.dc->height;
@@ -1194,6 +1495,7 @@ U0 GameFrame()
       for (x = 0; x < scr_w; x++)
         if (bayer[(x & 3) + ((y & 3) << 2)] < 10.0) db[y * stride + x] = BLUE;
         else db[y * stride + x] = LTBLUE;
+  DrawCrackOverlay;
   frames++;
   if (t1 - fps_t >= 1.0) {
     fps = frames / (t1 - fps_t);
@@ -1225,6 +1527,7 @@ U0 HolyCraft()
   scr_w = gr.dc->width;
   scr_h = gr.dc->height;
   t0 = NowSecs();  fps_t = t0;  phys_acc = 0.0;
+  day_time = 0.02;                       // just after dawn
   fps = 0;  frames = 0;  quit = FALSE;
   #ifdef __HCC__
   while (!quit) GameFrame;

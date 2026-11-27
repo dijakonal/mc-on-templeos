@@ -60,7 +60,7 @@ FONT = {
 
 # Classic 16x16 Minecraft-style pixel patterns, emitted as one U64 per row.
 # Digits are shade-ramp indices: 0 = lit/base color, 15 = dark/shade color.
-B_COUNT = 13
+B_COUNT = 14
 SIDES = (0, 1, 4, 5)  # POSX, NEGX, POSZ, NEGZ
 
 
@@ -200,6 +200,23 @@ def _ore(seed, vals):
     return rows
 
 
+def _cobble(seed):
+    # Rounded stone chunks separated by dark mortar; per-cell brightness
+    # variation makes the individual cobbles read clearly.
+    rows = [[0] * 16 for _ in range(16)]
+    rng = random.Random(seed + 11)
+    for y in range(16):
+        for x in range(16):
+            gx, gy = x // 4, y // 4
+            mx, my = x % 4, y % 4
+            base = 7 + ((gx * 3 + gy * 5 + ((gx * gy) & 3)) & 3)
+            if mx == 0 or my == 0:
+                base -= 3
+            v = base + rng.randrange(2)
+            rows[y][x] = max(2, min(13, v))
+    return rows
+
+
 def _texture_rows(blk, direction):
     seed = blk * 101 + direction * 17 + 5
     if blk == 1:    # grass
@@ -218,6 +235,7 @@ def _texture_rows(blk, direction):
     if blk == 10: return _gravel(seed)              # gravel
     if blk == 11: return _ore(seed, (14, 15))       # coal ore
     if blk == 12: return _ore(seed, (12, 13, 14))   # iron ore
+    if blk == 13: return _cobble(seed)              # cobblestone
     return _stone(seed)
 
 
@@ -238,6 +256,8 @@ def _texture_code():
 GPU_BLOCK = r'''#define GPU_W            800
 #define GPU_H            600
 #define GPU_ALPHA_WATER  140
+#define GPU_ALPHA_CLOUD  185
+#define MC_CLOUD_Y       34.0
 #define GPU_PERSPECTIVE_SCALE 4096
 
 // HolyCraft graphical layer: one RGB back buffer, two backends.
@@ -254,6 +274,7 @@ U32  gl_pal[16];
 U8  *gl_lut;
 U64  gpu_font[128];
 U32  sky_row[GPU_H];
+U32  sky_row_n[GPU_H];                   // night gradient (scaled day rows)
 U32  haze_col;
 U32 *face_cols;
 U64 gt_rows[B_COUNT * 6 * 16];           // 16 rows of packed 16x16 texel shades
@@ -438,6 +459,10 @@ U0 GpuSkyInit()
     sky_row[y] = GpuMix(GpuRgb(24, 66, 118), GpuRgb(169, 214, 242),
                         y * 256 / GPU_H);
   haze_col = GpuRgb(222, 240, 255);
+  // Night sky: the day gradient scaled way down, mixed back in per frame
+  // by the light level.
+  for (y = 0; y < GPU_H; y++)
+    sky_row_n[y] = GpuScale(sky_row[y], 42);
 }
 
 U0 GpuBlockColor(I64 blk, I64 dir, I64 bx, I64 by, I64 bz, U32 *ca, U32 *cb)
@@ -472,6 +497,8 @@ U0 GpuBlockColor(I64 blk, I64 dir, I64 bx, I64 by, I64 bz, U32 *ca, U32 *cb)
     base = GpuRgb(140, 140, 142); shade = GpuRgb(26, 26, 30);
   } else if (blk == B_IRON_ORE) {
     base = GpuRgb(140, 140, 142); shade = GpuRgb(224, 158, 92);
+  } else if (blk == B_COBBLE) {
+    base = GpuRgb(150, 150, 152); shade = GpuRgb(88, 88, 92);
   }
   if (dir == D_NEGY) {
     tmp = base; base = shade; shade = tmp;
@@ -575,8 +602,110 @@ U0 GpuFontInit()
 
 '''
 
-FILL_FACE = r'''U0 FillFace(I64 fi)
+CLOUDS_CODE = """U0 EmitClouds()
 {
+  // Translucent white quads drifting east at cloud height, from a hashed
+  // 24-block cell grid so clumps stay stable in world space.  Both facings
+  // are emitted: from below you see the underside, from above the top.
+  // Clouds ignore terrain fog (they read as above-weather) and only cull
+  // at 40 blocks of forward distance.
+  F64 t2, sxx, syy, depth, xmin, xmax, ymin, ymax, wx0, wz0, off;
+  F64 cx4[4], cy4[4], cz4[4], ox[5], oy[5], oz[5], wx, wy, wz;
+  I64 pcx, pcz, cx, cz, i, nv, ci, cj, fi, k, dir, j;
+  I64 lightpct;
+  U32 ca, cb;
+  if (fcount > MC_MAX_FACES - 16) return;
+  off = t0 * 0.55;
+  pcx = ToI64(Floor((P.x + off) / 24.0));
+  pcz = ToI64(Floor(P.z / 24.0));
+  lightpct = 35 + ToI64(day_light * 65.0);
+  for (cx = pcx - 2; cx <= pcx + 2; cx++) {
+    for (cz = pcz - 2; cz <= pcz + 2; cz++) {
+      if ((Hash2i(cx, cz) & 7) < 3) {
+        wx0 = cx * 24 - off;
+        wz0 = cz * 24;
+        for (dir = 3; dir >= 2; dir--) {
+          if (fcount > MC_MAX_FACES - 8) break;
+          for (k = 0; k < 4; k++) {
+            i = face_corners[dir][k];
+            cx4[k] = wx0 + corn_x[i] * 24;
+            cy4[k] = MC_CLOUD_Y;
+            cz4[k] = wz0 + corn_z[i] * 24;
+          }
+          nv = 0;
+          for (i = 0; i < 4; i++) {
+            wx = cx4[i] - cam_ex;
+            wy = cy4[i] - cam_ey;
+            wz = cz4[i] - cam_ez;
+            cz4[i] = wx * cam_fx + wy * cam_fy + wz * cam_fz;
+            cy4[i] = wx * cam_ux + wy * cam_uy + wz * cam_uz;
+            cx4[i] = wx * cam_rx + wy * cam_ry + wz * cam_rz;
+          }
+          for (i = 0; i < 4; i++) {
+            ci = cz4[i] >= MC_NEAR;
+            cj = cz4[(i + 1) & 3] >= MC_NEAR;
+            if (ci) {
+              ox[nv] = cx4[i];  oy[nv] = cy4[i];  oz[nv] = cz4[i];  nv++;
+            }
+            if (ci != cj) {
+              t2 = (MC_NEAR - cz4[i]) / (cz4[(i + 1) & 3] - cz4[i]);
+              ox[nv] = cx4[i] + (cx4[(i + 1) & 3] - cx4[i]) * t2;
+              oy[nv] = cy4[i] + (cy4[(i + 1) & 3] - cy4[i]) * t2;
+              oz[nv] = MC_NEAR;
+              nv++;
+            }
+          }
+          if (nv >= 3) {
+            depth = 0;
+            for (i = 0; i < nv; i++) {
+              sxx = scr_w * 0.5 + ox[i] * gpu_focal / oz[i];
+              syy = scr_h * 0.5 - oy[i] * gpu_focal / oz[i];
+              fxs[fcount * 5 + i] = sxx;
+              fys[fcount * 5 + i] = syy;
+              // Textureless: UVs are 0 so every texel lands on shade 0,
+              // and fiw keeps the perspective divide in range.
+              ftu[fcount * 5 + i] = 0;
+              ftv[fcount * 5 + i] = 0;
+              fiw[fcount * 5 + i] = ToI64(GPU_PERSPECTIVE_SCALE / oz[i]);
+              depth += oz[i];
+            }
+            depth /= nv;
+            if (depth <= 40.0) {
+              xmin = xmax = fxs[fcount * 5];
+              ymin = ymax = fys[fcount * 5];
+              for (i = 1; i < nv; i++) {
+                sxx = fxs[fcount * 5 + i];
+                syy = fys[fcount * 5 + i];
+                if (sxx < xmin) xmin = sxx;
+                if (sxx > xmax) xmax = sxx;
+                if (syy < ymin) ymin = syy;
+                if (syy > ymax) ymax = syy;
+              }
+              if (xmax >= 0 && xmin < scr_w && ymax >= 0 && ymin < scr_h) {
+                fi = fcount;
+                fnverts[fi] = nv;
+                ca = GpuScale(GpuRgb(246, 248, 252), lightpct);
+                cb = GpuScale(GpuRgb(214, 224, 236), lightpct);
+                for (k = 0; k < 16; k++) face_cols[fi * 16 + k] = GpuMix(ca, cb, k * 16);
+                fcolA[fi] = ca;
+                fcolB[fi] = cb;
+                falpha[fi] = GPU_ALPHA_CLOUD;
+                fblk[fi] = B_AIR;
+                fdir[fi] = dir;
+                ffogT[fi] = 0;
+                fdepth[fi] = depth;
+                fcount++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+"""
+FILL_FACE = r'''U0 FillFace(I64 fi){
   I64 n, e, a, b2, y, ymin, ymax, x, x0, x1, row, tx, ty, alpha, blk, dir, texbase;
   I64 fbase, ul, ur, vl, vr, wl, wr, tu, tv, ww, du, dv, dw, upx, upy, inv;
   I64 ua, ub, va, vb, wa, wb, fb, band, fullfog;
@@ -687,35 +816,137 @@ FILL_FACE = r'''U0 FillFace(I64 fi)
 
 '''
 
-SKY_HUD = r'''U0 DrawSky()
+SKY_HUD = r'''U0 DrawSkyBody(F64 dx, F64 dy, F64 dz, I64 radius, U32 core, U32 ring, I64 alpha){
+  // Project a celestial body direction and stamp a dithered disc.
+  F64 sx, sy, u, v, t, cz, px, py;
+  I64 x, y;
+  px = dx * cam_rx + dy * cam_ry + dz * cam_rz;
+  py = dx * cam_ux + dy * cam_uy + dz * cam_uz;
+  cz = dx * cam_fx + dy * cam_fy + dz * cam_fz;
+  if (cz < 0.1) return;
+  sx = scr_w * 0.5 + px * gpu_focal / cz;
+  sy = scr_h * 0.5 - py * gpu_focal / cz;
+  for (v = -radius - 3; v <= radius + 3; v++)
+    for (u = -radius - 3; u <= radius + 3; u++) {
+      x = ToI64(sx) + u;  y = ToI64(sy) + v;
+      if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
+        t = Sqrt(u * u + v * v);
+        if (t < radius) db[y * stride + x] = GpuMix(db[y * stride + x], core, alpha);
+        else if (t < radius + 2.5)
+          db[y * stride + x] = GpuMix(db[y * stride + x], ring, alpha >> 1);
+      }
+    }
+}
+
+U0 DrawSky()
 {
-  F64 sx, sy, u, v, t, cz;
-  I64 y, row, x, horizon, hw;
-  U32 c;
+  F64 sx, sy, u, v, t, cz, a, dx, dy, dz, px, py, fade;
+  I64 y, row, x, horizon, hw, i, lightv, starn, sx_i, sy_i;
+  U32 c, day, night;
   horizon = scr_h * 0.5 + Sin(P.pitch) / Cos(P.pitch) * gpu_focal;
   horizon = IClamp(horizon, -scr_h, 2 * scr_h);
+  lightv = ToI64(day_light * 255.0);
   for (y = 0; y < scr_h; y++) {
-    c = sky_row[y];
+    day = sky_row[y];
+    night = sky_row_n[y];
     // Haze peaks at the horizon and fades out over +/-6 rows instead of
     // being a hard band.
     hw = 255 - ToI64(FFabs(y - horizon) * 42.5);
+    c = GpuMix(night, day, lightv);
     if (hw > 0) c = GpuMix(c, haze_col, hw);
     MemSetU32(db + y * stride, c, scr_w);
   }
-  cz = 0.45 * cam_fx + 0.75 * cam_fy + 0.45 * cam_fz;
-  if (cz > 0.1) {
-    sx = scr_w * 0.5 + (0.45 * cam_rx + 0.75 * cam_ry + 0.45 * cam_rz) * gpu_focal / cz;
-    sy = scr_h * 0.5 - (0.45 * cam_ux + 0.75 * cam_uy + 0.45 * cam_uz) * gpu_focal / cz;
-    for (v = -16; v <= 16; v++)
-      for (u = -16; u <= 16; u++) {
-        x = sx + u;  y = sy + v;
-        if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
-          t = Sqrt(u * u + v * v);
-          if (t < 10.0) db[y * stride + x] = GpuRgb(255, 238, 170);
-          else if (t < 14.0) db[y * stride + x] =
-            GpuMix(db[y * stride + x], GpuRgb(255, 238, 170), ToI64((14.0 - t) * 60));
+  // stars: hashed dome positions rotating with the sun arc, fading in as
+  // the light level drops
+  if (day_light < 0.55) {
+    starn = ToI64((0.55 - day_light) * 2.0 * 255.0);
+    a = day_time * 6.2832;
+    for (i = 0; i < 56; i++) {
+      dx = Cos(a + (Hash2i(i * 3 + 1, 7) & 1023) * 0.0061) * 0.85;
+      dy = Sin(a + (Hash2i(i * 5 + 2, 11) & 511) * 0.0061) * 0.9;
+      dz = 0.35 + (Hash2i(i * 7 + 3, 13) & 255) * 0.0012;
+      px = dx * cam_rx + dy * cam_ry + dz * cam_rz;
+      py = dx * cam_ux + dy * cam_uy + dz * cam_uz;
+      cz = dx * cam_fx + dy * cam_fy + dz * cam_fz;
+      if (cz >= 0.1) {
+        sx = scr_w * 0.5 + px * gpu_focal / cz;
+        sy = scr_h * 0.5 - py * gpu_focal / cz;
+        sx_i = ToI64(sx);  sy_i = ToI64(sy);
+        if (sx_i >= 0 && sx_i < scr_w && sy_i >= 0 && sy_i < scr_h)
+          db[sy_i * stride + sx_i] = GpuMix(db[sy_i * stride + sx_i],
+                                            GpuRgb(255, 255, 255), starn);
+      }
+    }
+  }
+  // fog follows the light level so night fog goes dark too
+  mcr_fog_col = GpuMix(GpuRgb(22, 30, 56), GpuRgb(169, 214, 242), lightv);
+  // sun and moon ride opposite ends of the same rotating arc: noon is
+  // day_time 0.25, midnight 0.75
+  a = day_time * 6.2832;
+  dx = Cos(a) * 0.85;
+  dy = Sin(a);
+  dz = 0.35;
+  fade = FClamp(dy * 4.0 + 0.5, 0.0, 1.0);
+  if (fade > 0.02)
+    DrawSkyBody(dx, dy, dz, 7, GpuRgb(255, 238, 170), GpuRgb(255, 214, 96),
+                ToI64(fade * 255.0));
+  fade = FClamp(-dy * 4.0 + 0.5, 0.0, 1.0);
+  if (fade > 0.02)
+    DrawSkyBody(-dx, -dy, -dz, 6, GpuRgb(228, 232, 240), GpuRgb(150, 158, 176),
+                ToI64(fade * 255.0));
+}
+
+U0 DrawCrackOverlay()
+{
+  // Darkening dither over the block being mined; the density grows with
+  // the progress so it reads as cracks spreading over the block.
+  // BLACK index 0 / RGB 0 both read as black, so this is backend-neutral.
+  F64 vx[8], vy[8], vz[8], cx, cy, cz, sxx[8], syy[8], frac, t, ya, yb, xa, xb, xl, xr;
+  I64 i, j, f, k, stage, x, y, x0, x1, y0, y1, row, c[4];
+  if (!mining || mine_progress <= 0.0) return;
+  frac = mine_progress / blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]];
+  frac = FClamp(frac, 0.0, 0.999);
+  stage = ToI64(frac * 8.0) + 1;
+  for (i = 0; i < 8; i++) {
+    vx[i] = mine_hx + corn_x[i] - cam_ex;
+    vy[i] = mine_hy + corn_y[i] - cam_ey;
+    vz[i] = mine_hz + corn_z[i] - cam_ez;
+    cz = vx[i] * cam_fx + vy[i] * cam_fy + vz[i] * cam_fz;
+    if (cz < MC_NEAR) return;           // only when fully visible
+    cx = vx[i] * cam_rx + vy[i] * cam_ry + vz[i] * cam_rz;
+    cy = vx[i] * cam_ux + vy[i] * cam_uy + vz[i] * cam_uz;
+    sxx[i] = scr_w * 0.5 + cx * gpu_focal / cz;
+    syy[i] = scr_h * 0.5 - cy * gpu_focal / cz;
+  }
+  for (f = 0; f < 6; f++) {
+    for (k = 0; k < 4; k++) c[k] = face_corners[f][k];
+    y0 = scr_h;  y1 = 0;
+    for (k = 0; k < 4; k++) {
+      if (ToI64(syy[c[k]]) < y0) y0 = ToI64(syy[c[k]]);
+      if (ToI64(syy[c[k]]) > y1) y1 = ToI64(syy[c[k]]);
+    }
+    y0 = IClamp(y0, 0, scr_h - 1);
+    y1 = IClamp(y1, 0, scr_h - 1);
+    for (y = y0; y <= y1; y++) {
+      xl = 1e9;  xr = -1e9;
+      for (j = 0; j < 4; j++) {
+        k = (j + 1) & 3;
+        ya = syy[c[j]];  yb = syy[c[k]];
+        if (ya != yb && ((y >= ya && y < yb) || (y >= yb && y < ya))) {
+          t = (y - ya) / (yb - ya);
+          xa = sxx[c[j]] + (sxx[c[k]] - sxx[c[j]]) * t;
+          if (xa < xl) xl = xa;
+          if (xa > xr) xr = xa;
         }
       }
+      if (xr >= xl) {
+        x0 = IClamp(ToI64(Ceil(xl)), 0, scr_w - 1);
+        x1 = IClamp(ToI64(Floor(xr)), 0, scr_w - 1);
+        row = y * stride;
+        for (x = x0; x <= x1; x++)
+          if (bayer[(x & 3) + ((y & 3) << 2)] < stage) db[row + x] = BLACK;
+      }
+    }
   }
 }
 
@@ -894,8 +1125,13 @@ def main():
                         '  else if (dir == D_NEGY) { fcolA[fcount] = bi->bot_a;  fcolB[fcount] = bi->bot_b; }\n'
                         '  else                    { fcolA[fcount] = bi->side_a; fcolB[fcount] = bi->side_b; }',
                      '  U32 ca, cb, c;\n'
+                        '  I64 lightpct;\n'
                         '  blk = world[WIdx(bx, by, bz)];\n'
                         '  GpuBlockColor(blk, dir, bx, by, bz, &ca, &cb);\n'
+                        '  // Night dims block colors down to ~35% brightness.\n'
+                        '  lightpct = 35 + ToI64(day_light * 65.0);\n'
+                        '  ca = GpuScale(ca, lightpct);\n'
+                        '  cb = GpuScale(cb, lightpct);\n'
                         '  fcolA[fcount] = ca;  fcolB[fcount] = cb;\n'
                         '  fblk[fcount] = blk;  fdir[fcount] = dir;\n'
                         '  if (blk == B_WATER) falpha[fcount] = GPU_ALPHA_WATER;\n'
@@ -938,8 +1174,14 @@ def main():
                         '    face_cols[fi * 16 + i] = GpuMix(ca, cb, i * 16);\n'
                         '  }', 'fog scale')
 
-    s = cut_replace(s, 'U0 DrawSky()\n{', '// =============================== GAMEPLAY',
+    s = cut_replace(s, 'U0 DrawSkyBody(F64 dx, F64 dy, F64 dz, I64 radius, U8 core, U8 ring)',
+                    '// =============================== GAMEPLAY',
                     SKY_HUD, 'sky and hud')
+
+    # Clouds: replace the 16-color stub with translucent drifting quads at
+    # cloud height (both facings, so they read from above and below).
+    s = cut_replace(s, 'U0 EmitClouds()\n{', 'U0 BuildFaceList()', CLOUDS_CODE,
+                    'clouds')
 
     s = replace_once(s, '        if (bayer[(x & 3) + ((y & 3) << 2)] < 10.0) db[y * stride + x] = BLUE;\n'
                         '        else db[y * stride + x] = LTBLUE;',

@@ -91,16 +91,19 @@ paths as the TempleOS builds.
 | `W` `A` `S` `D` | Walk / swim / fly horizontally |
 | Mouse | Look around |
 | `Space` | Jump, swim up, or fly up |
-| `Shift` | Sprint on ground; fly down when flying |
+| `Ctrl` (hold) | Sprint |
+| `Shift` | Sneak on the ground; fly down when flying |
 | `F` | Toggle creative flight |
-| Left mouse button | Break the targeted block |
-| Right mouse button | Place the selected block |
-| `1`–`6` | Select hotbar slot (grass, dirt, stone, sand, wood, leaves) |
+| Left mouse button (hold) | Mine the targeted block — cracks spread, then it drops into the hotbar |
+| Right mouse button | Place the selected block (consumes one) |
+| `1`–`6` | Select hotbar slot |
 | Arrow keys | Alternative look controls |
 | `Esc` | Quit back to TempleOS |
 
-The HUD shows FPS, player coordinates, the block under the crosshair and the
-hotbar. Bedrock cannot be broken; you cannot place a block inside yourself.
+The HUD shows FPS, player coordinates, the block under the crosshair, a
+mining progress bar and the hotbar with stack counts. Bedrock cannot be
+broken; you cannot place a block inside yourself; placing needs items in
+the selected slot.
 
 ## What is implemented
 
@@ -138,6 +141,21 @@ hotbar. Bedrock cannot be broken; you cannot place a block inside yourself.
   take a fast path that skips texel sampling entirely. The underwater
   overlay blends through a precomputed 16-entry Bayer lookup instead of
   half a million `GpuMix` calls per frame.
+* Day/night cycle on a 20-minute Minecraft clock: the sun and moon ride a
+  rotating arc (drawn with soft edges on the GPU build), stars fade in at
+  night, the GPU build dims block colors and fog with the light level, and
+  the 16-color build dithers between day and night sky palettes.
+* Drifting translucent clouds in the layered build, generated from a hashed
+  cell grid and sorted into the painter pass at cloud height.
+* Survival basics: hold the left button to mine (per-block hardness, crack
+  dither overlay on the block and a HUD progress bar), broken blocks drop
+  Minecraft-style (grass drops dirt, stone drops cobblestone, leaves drop
+  nothing) into hotbar slots with stack counts, and placing consumes from
+  the selected slot. Cobblestone is a new block with its own texture.
+* Gravity blocks: sand and gravel fall cell-by-cell when the support under
+  them is removed, cascading down whole columns.
+* Minecraft control layout: `Ctrl` sprints, `Shift` sneaks on the ground
+  (and still descends while flying).
 * Classic 16x16 Minecraft-style face textures. Each face carries UV
   coordinates through near-plane clipping and scanline rasterization.
   `u/z`, `v/z` and `1/z` are interpolated linearly across every scanline and

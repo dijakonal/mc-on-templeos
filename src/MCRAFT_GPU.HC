@@ -60,6 +60,8 @@
 #define MC_SWIM_SPEED   2.6
 #define MC_TERMINAL_VY  48.0
 #define MC_STEP_TIME    (1.0 / 30.0)    // physics substep, decoupled from FPS
+#define MC_DAY_LENGTH   1200.0          // full day+night cycle, 20 min like Minecraft
+#define MC_SNEAK_SPEED  1.3             // Java Edition sneak speed
 #define MC_HALF         0.30            // player half-width
 #define MC_HEIGHT       1.80            // player height
 #define MC_EYE          1.62            // eye height above feet
@@ -80,7 +82,8 @@
 #define B_GRAVEL        10
 #define B_COAL_ORE      11
 #define B_IRON_ORE      12
-#define B_COUNT         13
+#define B_COBBLE        13
+#define B_COUNT         14
 
 // ---- face dirs ----
 #define D_POSX  0
@@ -96,6 +99,7 @@
 #define MC_SC_S         0x1F
 #define MC_SC_D         0x20
 #define MC_SC_F         0x21
+#define MC_SC_CTRL      0x1D
 #define MC_SC_1         0x02
 #define MC_SC_2         0x03
 #define MC_SC_3         0x04
@@ -108,7 +112,7 @@
 
 
 // hcc already knows Bool; TempleOS has it built in.
-// Note: the game deliberately does not touch Fs->win_inhibit — the TempleOS
+// Note: the game deliberately does not touch Fs->win_inhibit (the TempleOS
 // task default already matches WIG_TASK_DFT, and hcc's compiler cannot
 // parse that member access (it walks even disabled branches and its error
 // formatter crashes on the property check).
@@ -116,10 +120,6 @@
 #ifdef __HCC__
 #include "compat_hcc.HC"
 #endif
-
-
-
-
 
 class CBlockInfo {
   U8 *name;
@@ -144,7 +144,35 @@ U8 world[MC_WORLD_SX * MC_WORLD_SZ * MC_WORLD_SY];
 U8 colmax[MC_WORLD_SX * MC_WORLD_SZ];   // top solid block + 1, per column
 
 I64 hotbar_items[6];
+I64 hotbar_count[6];
 I64 hotbar_sel;
+
+// ---- day/night cycle ------------------------------------------------------
+// day_time runs 0..1 over MC_DAY_LENGTH seconds: 0 = dawn, 0.25 = noon,
+// 0.5 = dusk, 0.75 = midnight.  day_light is 0..1 and drives the sky,
+// fog and (GPU build) face brightness.
+F64 day_time;
+F64 day_light;
+
+// ---- mining ----------------------------------------------------------------
+F64  blk_hard[B_COUNT];                // seconds to break, -1 = unmineable
+I64  mine_hx, mine_hy, mine_hz;        // block being mined
+I64  mine_face, last_hx, last_hy, last_hz;
+F64  mine_progress;                    // seconds accumulated on it
+Bool mining;
+
+// ---- falling blocks (sand / gravel) ---------------------------------------
+I64 fall_x[64], fall_y[64], fall_z[64];
+I64 fall_n;
+
+// ---- main-loop state -------------------------------------------------------
+// Shared with GameFrame so the loop body can live in its own function
+// (hcc's transpiler cannot handle try/catch around the loop), and used by
+// the cloud layer for its drift clock.  Declared early: HolyC has no
+// forward references.
+Bool quit;
+I64 fps, frames;
+F64 t0, fps_t, phys_acc;
 
 // ---- tiny math helpers (named to avoid clobbering TempleOS builtins) ----
 I64 IAbs(I64 v)
@@ -283,15 +311,64 @@ U0 RecalcCol(I64 x, I64 z)
   colmax[x + z * MC_WORLD_SX] = y + 1;
 }
 
+U0 EnqueueFall(I64 x, I64 y, I64 z)
+{
+  if (fall_n >= 64) return;
+  fall_x[fall_n] = x;  fall_y[fall_n] = y;  fall_z[fall_n] = z;
+  fall_n++;
+}
+
 U0 SetBlockUpdate(I64 x, I64 y, I64 z, I64 b)
 {
+  I64 ab;
   SetBlockRaw(x, y, z, b);
   if (x >= 0 && x < MC_WORLD_SX && z >= 0 && z < MC_WORLD_SZ)
     RecalcCol(x, z);
+  // Gravity blocks: what we just changed and what sits on top of it may
+  // need to start falling.
+  if (y + 1 < MC_WORLD_SY) {
+    ab = GetBlock(x, y + 1, z);
+    if (ab == B_SAND || ab == B_GRAVEL) EnqueueFall(x, y + 1, z);
+  }
+}
+
+// Gravity blocks sink one cell per frame, like Minecraft's falling sand.
+U0 ProcessFalls()
+{
+  I64 i, o, n0, b, below, x, y, z;
+  n0 = fall_n;                          // entries appended below wait a frame
+  o = 0;
+  for (i = 0; i < n0; i++) {
+    x = fall_x[i];  y = fall_y[i];  z = fall_z[i];
+    b = GetBlock(x, y, z);
+    if (b == B_SAND || b == B_GRAVEL) {
+      below = GetBlock(x, y - 1, z);
+      if (below == B_AIR || below == B_WATER) {
+        SetBlockUpdate(x, y, z, B_AIR);
+        SetBlockUpdate(x, y - 1, z, b);
+        if (y > 1) EnqueueFall(x, y - 1, z);   // keep sinking next frame
+        EnqueueFall(x, y + 1, z);              // the block above may follow
+      }
+    }
+  }
+  // Compact: keep only entries that still need to fall (this re-check also
+  // covers the entries appended during the pass).
+  for (i = 0; i < fall_n; i++) {
+    b = GetBlock(fall_x[i], fall_y[i], fall_z[i]);
+    if (b == B_SAND || b == B_GRAVEL) {
+      below = GetBlock(fall_x[i], fall_y[i] - 1, fall_z[i]);
+      if (below == B_AIR || below == B_WATER) {
+        fall_x[o] = fall_x[i];  fall_y[o] = fall_y[i];  fall_z[o] = fall_z[i];
+        o++;
+      }
+    }
+  }
+  fall_n = o;
 }
 
 U0 InitBlocks()
 {
+  I64 i;
   blkinfo[B_AIR].name = "Air";
   blkinfo[B_AIR].solid = FALSE;    blkinfo[B_AIR].targetable = FALSE;
 
@@ -367,12 +444,35 @@ U0 InitBlocks()
   blkinfo[B_IRON_ORE].bot_a  = BROWN;  blkinfo[B_IRON_ORE].bot_b  = DKGRAY;
   blkinfo[B_IRON_ORE].solid = TRUE;    blkinfo[B_IRON_ORE].targetable = TRUE;
 
-  hotbar_items[0] = B_GRASS;
-  hotbar_items[1] = B_DIRT;
-  hotbar_items[2] = B_STONE;
-  hotbar_items[3] = B_SAND;
-  hotbar_items[4] = B_WOOD;
-  hotbar_items[5] = B_LEAVES;
+  blkinfo[B_COBBLE].name = "Cobblestone";
+  blkinfo[B_COBBLE].top_a  = LTGRAY; blkinfo[B_COBBLE].top_b  = DKGRAY;
+  blkinfo[B_COBBLE].side_a = DKGRAY; blkinfo[B_COBBLE].side_b = LTGRAY;
+  blkinfo[B_COBBLE].bot_a  = DKGRAY; blkinfo[B_COBBLE].bot_b  = BLACK;
+  blkinfo[B_COBBLE].solid = TRUE;    blkinfo[B_COBBLE].targetable = TRUE;
+
+  // Seconds of continuous mining to break each block by hand, tuned for
+  // playability (Minecraft's bare-hand times are much longer).  -1 = not
+  // mineable.
+  blk_hard[B_GRASS]   = 0.45;
+  blk_hard[B_DIRT]    = 0.40;
+  blk_hard[B_STONE]   = 1.10;
+  blk_hard[B_COBBLE]  = 1.10;
+  blk_hard[B_SAND]    = 0.35;
+  blk_hard[B_GRAVEL]  = 0.40;
+  blk_hard[B_SNOW]    = 0.25;
+  blk_hard[B_WOOD]    = 0.80;
+  blk_hard[B_LEAVES]  = 0.20;
+  blk_hard[B_COAL_ORE]  = 1.40;
+  blk_hard[B_IRON_ORE]  = 1.60;
+  blk_hard[B_BEDROCK] = -1.0;
+  blk_hard[B_WATER]   = -1.0;
+  blk_hard[B_AIR]     = -1.0;
+
+  // Survival start: empty inventory, punch trees for wood.
+  for (i = 0; i < 6; i++) {
+    hotbar_items[i]  = 0;
+    hotbar_count[i]  = 0;
+  }
   hotbar_sel      = 0;
 }
 
@@ -595,7 +695,7 @@ U0 UpdatePlayer(F64 dt)
 {
   F64 fwd_x, fwd_z, rgt_x, rgt_z, mx, mz, spd, k, accel;
   I64 wbx, wby, wbz;
-  Bool in_water, sprint;
+  Bool in_water, sprint, sneak;
   mx = 0; mz = 0;
   fwd_x = Sin(P.yaw);  fwd_z = Cos(P.yaw);
   rgt_x = Cos(P.yaw);  rgt_z = -Sin(P.yaw);
@@ -606,9 +706,13 @@ U0 UpdatePlayer(F64 dt)
   wbx = P.x; wby = P.y + 0.4; wbz = P.z;
   in_water = GetBlock(wbx, wby, wbz) == B_WATER ||
              GetBlock(P.x, P.y + MC_EYE, P.z) == B_WATER;
-  sprint = Bt(kbd.down_bitmap, SC_SHIFT) && !P.flying && !in_water;
+  // Minecraft controls: Ctrl sprints, Shift sneaks (Shift still descends
+  // while flying).
+  sprint = Bt(kbd.down_bitmap, MC_SC_CTRL) && !P.flying && !in_water;
+  sneak = Bt(kbd.down_bitmap, SC_SHIFT) && P.on_ground && !P.flying && !in_water;
   if (P.flying) spd = MC_FLY_SPEED;
   else if (sprint) spd = MC_SPRINT_SPEED;
+  else if (sneak) spd = MC_SNEAK_SPEED;
   else if (in_water) spd = MC_SWIM_SPEED;
   else spd = MC_WALK_SPEED;
   if (mx != 0.0 || mz != 0.0) {
@@ -720,6 +824,8 @@ I64  scr_w, scr_h;
 #define GPU_W            800
 #define GPU_H            600
 #define GPU_ALPHA_WATER  140
+#define GPU_ALPHA_CLOUD  185
+#define MC_CLOUD_Y       34.0
 #define GPU_PERSPECTIVE_SCALE 4096
 
 // HolyCraft graphical layer: one RGB back buffer, two backends.
@@ -736,6 +842,7 @@ U32  gl_pal[16];
 U8  *gl_lut;
 U64  gpu_font[128];
 U32  sky_row[GPU_H];
+U32  sky_row_n[GPU_H];                   // night gradient (scaled day rows)
 U32  haze_col;
 U32 *face_cols;
 U64 gt_rows[B_COUNT * 6 * 16];           // 16 rows of packed 16x16 texel shades
@@ -920,6 +1027,10 @@ U0 GpuSkyInit()
     sky_row[y] = GpuMix(GpuRgb(24, 66, 118), GpuRgb(169, 214, 242),
                         y * 256 / GPU_H);
   haze_col = GpuRgb(222, 240, 255);
+  // Night sky: the day gradient scaled way down, mixed back in per frame
+  // by the light level.
+  for (y = 0; y < GPU_H; y++)
+    sky_row_n[y] = GpuScale(sky_row[y], 42);
 }
 
 U0 GpuBlockColor(I64 blk, I64 dir, I64 bx, I64 by, I64 bz, U32 *ca, U32 *cb)
@@ -954,6 +1065,8 @@ U0 GpuBlockColor(I64 blk, I64 dir, I64 bx, I64 by, I64 bz, U32 *ca, U32 *cb)
     base = GpuRgb(140, 140, 142); shade = GpuRgb(26, 26, 30);
   } else if (blk == B_IRON_ORE) {
     base = GpuRgb(140, 140, 142); shade = GpuRgb(224, 158, 92);
+  } else if (blk == B_COBBLE) {
+    base = GpuRgb(150, 150, 152); shade = GpuRgb(88, 88, 92);
   }
   if (dir == D_NEGY) {
     tmp = base; base = shade; shade = tmp;
@@ -2219,6 +2332,102 @@ U0 GpuTextureInit()
   gt_rows[1245] = 0x2236A3673A25DED2;
   gt_rows[1246] = 0x255657476645677B;
   gt_rows[1247] = 0x32727A2524722643;
+  gt_rows[1248] = 0x5545788776766655;
+  gt_rows[1249] = 0x58778BAA69AA6888;
+  gt_rows[1250] = 0x57887BAB7A9A6888;
+  gt_rows[1251] = 0x57778BAA79A96888;
+  gt_rows[1252] = 0x5665665555656556;
+  gt_rows[1253] = 0x5898698959985889;
+  gt_rows[1254] = 0x6989589868995888;
+  gt_rows[1255] = 0x5889588858886898;
+  gt_rows[1256] = 0x6767878845456666;
+  gt_rows[1257] = 0x7AAA8AAB58875888;
+  gt_rows[1258] = 0x69AA7BBB57786988;
+  gt_rows[1259] = 0x69998AAA47876998;
+  gt_rows[1260] = 0x8787666577875665;
+  gt_rows[1261] = 0x7ABA59987AAA5988;
+  gt_rows[1262] = 0x8AAB59887BBB5988;
+  gt_rows[1263] = 0x7ABA58887BBB5899;
+  gt_rows[1264] = 0x5444888867775566;
+  gt_rows[1265] = 0x57887AAA79AA6888;
+  gt_rows[1266] = 0x57888AAB69AA6989;
+  gt_rows[1267] = 0x57888ABA79A95988;
+  gt_rows[1268] = 0x6665666655665555;
+  gt_rows[1269] = 0x6998688868996989;
+  gt_rows[1270] = 0x6888598968986988;
+  gt_rows[1271] = 0x5888698859885988;
+  gt_rows[1272] = 0x6666878744455556;
+  gt_rows[1273] = 0x7AA97ABA47775998;
+  gt_rows[1274] = 0x69997BAA57776989;
+  gt_rows[1275] = 0x7AAA8BAA57885888;
+  gt_rows[1276] = 0x7877565678885556;
+  gt_rows[1277] = 0x8AAA68897ABA6998;
+  gt_rows[1278] = 0x8BAB59998BBB6999;
+  gt_rows[1279] = 0x8AAA68898ABA5889;
+  gt_rows[1280] = 0x4455778877675656;
+  gt_rows[1281] = 0x57878AAA79AA6889;
+  gt_rows[1282] = 0x47887ABB79A96989;
+  gt_rows[1283] = 0x57788AAB69A95988;
+  gt_rows[1284] = 0x5655566566665565;
+  gt_rows[1285] = 0x6889588858886989;
+  gt_rows[1286] = 0x5888589869895998;
+  gt_rows[1287] = 0x5988699858996989;
+  gt_rows[1288] = 0x6677887745446655;
+  gt_rows[1289] = 0x6A9A7BBB47875989;
+  gt_rows[1290] = 0x7A9A8BBB57786889;
+  gt_rows[1291] = 0x6A9A8ABB48885998;
+  gt_rows[1292] = 0x7888566677876655;
+  gt_rows[1293] = 0x8BAB58887ABB5988;
+  gt_rows[1294] = 0x8AAA59897AAA5889;
+  gt_rows[1295] = 0x7AAA68997ABB6898;
+  gt_rows[1296] = 0x5444887776776656;
+  gt_rows[1297] = 0x48788BAA79AA6999;
+  gt_rows[1298] = 0x58877AAA6A9A5998;
+  gt_rows[1299] = 0x48877BAB69A95998;
+  gt_rows[1300] = 0x5565666565666656;
+  gt_rows[1301] = 0x6899598968995988;
+  gt_rows[1302] = 0x6988588858895888;
+  gt_rows[1303] = 0x5989598968996999;
+  gt_rows[1304] = 0x7777778744446656;
+  gt_rows[1305] = 0x79A97AAA58775998;
+  gt_rows[1306] = 0x69998ABB48785899;
+  gt_rows[1307] = 0x79A97AAB57776889;
+  gt_rows[1308] = 0x8878666678785655;
+  gt_rows[1309] = 0x7BAA69998BBA5998;
+  gt_rows[1310] = 0x8ABB69888BAB5898;
+  gt_rows[1311] = 0x7AAA68887ABB5989;
+  gt_rows[1312] = 0x4545878776666555;
+  gt_rows[1313] = 0x48787AAB6A9A5999;
+  gt_rows[1314] = 0x47777BBB69995899;
+  gt_rows[1315] = 0x57777BBA79995988;
+  gt_rows[1316] = 0x5556566656566656;
+  gt_rows[1317] = 0x5999588958885998;
+  gt_rows[1318] = 0x5989699868895998;
+  gt_rows[1319] = 0x6889598968985889;
+  gt_rows[1320] = 0x7766778844445555;
+  gt_rows[1321] = 0x79AA8AAA57875898;
+  gt_rows[1322] = 0x79997BBA58885998;
+  gt_rows[1323] = 0x79A98ABB58886988;
+  gt_rows[1324] = 0x8788656677776656;
+  gt_rows[1325] = 0x8BAB69997AAB6998;
+  gt_rows[1326] = 0x8AAB58998BBA5899;
+  gt_rows[1327] = 0x8BBA68887BBA6899;
+  gt_rows[1328] = 0x4445778877675565;
+  gt_rows[1329] = 0x48888BAB69A95888;
+  gt_rows[1330] = 0x57777BAA69996888;
+  gt_rows[1331] = 0x58777AAA799A5989;
+  gt_rows[1332] = 0x6666555665565656;
+  gt_rows[1333] = 0x5889698969895898;
+  gt_rows[1334] = 0x6999688968995999;
+  gt_rows[1335] = 0x5988588958895889;
+  gt_rows[1336] = 0x6677888755555656;
+  gt_rows[1337] = 0x79A97BBA58886989;
+  gt_rows[1338] = 0x79AA7BBA58776898;
+  gt_rows[1339] = 0x7A997BBB57775889;
+  gt_rows[1340] = 0x8877566677875656;
+  gt_rows[1341] = 0x7ABB58997BAA6888;
+  gt_rows[1342] = 0x7BAB68887ABA5998;
+  gt_rows[1343] = 0x7AAA58998ABA6999;
   for (idx = 0; idx < B_COUNT * 6 * 16; idx++)
     for (t = 0; t < 16; t++) {
       k = (gt_rows[idx] >> ((15 - t) << 2)) & 15;
@@ -2425,8 +2634,7 @@ U0 InitRendererTables()
 }
 
 // scanline fill of a convex polygon (3..5 verts)
-U0 FillFace(I64 fi)
-{
+U0 FillFace(I64 fi){
   I64 n, e, a, b2, y, ymin, ymax, x, x0, x1, row, tx, ty, alpha, blk, dir, texbase;
   I64 fbase, ul, ur, vl, vr, wl, wr, tu, tv, ww, du, dv, dw, upx, upy, inv;
   I64 ua, ub, va, vb, wa, wb, fb, band, fullfog;
@@ -2560,8 +2768,13 @@ Bool EmitFace(I64 bx, I64 by, I64 bz, I64 dir)
   F64 sxx, syy, mind;
   I64 i, j, nv, ci, cj, fi, cidx, x, y, sx, sy, xmin, xmax, ymin, ymax, st, blk;
   U32 ca, cb, c;
+  I64 lightpct;
   blk = world[WIdx(bx, by, bz)];
   GpuBlockColor(blk, dir, bx, by, bz, &ca, &cb);
+  // Night dims block colors down to ~35% brightness.
+  lightpct = 35 + ToI64(day_light * 65.0);
+  ca = GpuScale(ca, lightpct);
+  cb = GpuScale(cb, lightpct);
   fcolA[fcount] = ca;  fcolB[fcount] = cb;
   fblk[fcount] = blk;  fdir[fcount] = dir;
   if (blk == B_WATER) falpha[fcount] = GPU_ALPHA_WATER;
@@ -2643,6 +2856,110 @@ Bool EmitFace(I64 bx, I64 by, I64 bz, I64 dir)
   return TRUE;
 }
 
+// Clouds: a no-op in the 16-color build; the GPU generator replaces this
+// stub with translucent quads drifting at cloud height.
+U0 EmitClouds()
+{
+  // Translucent white quads drifting east at cloud height, from a hashed
+  // 24-block cell grid so clumps stay stable in world space.  Both facings
+  // are emitted: from below you see the underside, from above the top.
+  // Clouds ignore terrain fog (they read as above-weather) and only cull
+  // at 40 blocks of forward distance.
+  F64 t2, sxx, syy, depth, xmin, xmax, ymin, ymax, wx0, wz0, off;
+  F64 cx4[4], cy4[4], cz4[4], ox[5], oy[5], oz[5], wx, wy, wz;
+  I64 pcx, pcz, cx, cz, i, nv, ci, cj, fi, k, dir, j;
+  I64 lightpct;
+  U32 ca, cb;
+  if (fcount > MC_MAX_FACES - 16) return;
+  off = t0 * 0.55;
+  pcx = ToI64(Floor((P.x + off) / 24.0));
+  pcz = ToI64(Floor(P.z / 24.0));
+  lightpct = 35 + ToI64(day_light * 65.0);
+  for (cx = pcx - 2; cx <= pcx + 2; cx++) {
+    for (cz = pcz - 2; cz <= pcz + 2; cz++) {
+      if ((Hash2i(cx, cz) & 7) < 3) {
+        wx0 = cx * 24 - off;
+        wz0 = cz * 24;
+        for (dir = 3; dir >= 2; dir--) {
+          if (fcount > MC_MAX_FACES - 8) break;
+          for (k = 0; k < 4; k++) {
+            i = face_corners[dir][k];
+            cx4[k] = wx0 + corn_x[i] * 24;
+            cy4[k] = MC_CLOUD_Y;
+            cz4[k] = wz0 + corn_z[i] * 24;
+          }
+          nv = 0;
+          for (i = 0; i < 4; i++) {
+            wx = cx4[i] - cam_ex;
+            wy = cy4[i] - cam_ey;
+            wz = cz4[i] - cam_ez;
+            cz4[i] = wx * cam_fx + wy * cam_fy + wz * cam_fz;
+            cy4[i] = wx * cam_ux + wy * cam_uy + wz * cam_uz;
+            cx4[i] = wx * cam_rx + wy * cam_ry + wz * cam_rz;
+          }
+          for (i = 0; i < 4; i++) {
+            ci = cz4[i] >= MC_NEAR;
+            cj = cz4[(i + 1) & 3] >= MC_NEAR;
+            if (ci) {
+              ox[nv] = cx4[i];  oy[nv] = cy4[i];  oz[nv] = cz4[i];  nv++;
+            }
+            if (ci != cj) {
+              t2 = (MC_NEAR - cz4[i]) / (cz4[(i + 1) & 3] - cz4[i]);
+              ox[nv] = cx4[i] + (cx4[(i + 1) & 3] - cx4[i]) * t2;
+              oy[nv] = cy4[i] + (cy4[(i + 1) & 3] - cy4[i]) * t2;
+              oz[nv] = MC_NEAR;
+              nv++;
+            }
+          }
+          if (nv >= 3) {
+            depth = 0;
+            for (i = 0; i < nv; i++) {
+              sxx = scr_w * 0.5 + ox[i] * gpu_focal / oz[i];
+              syy = scr_h * 0.5 - oy[i] * gpu_focal / oz[i];
+              fxs[fcount * 5 + i] = sxx;
+              fys[fcount * 5 + i] = syy;
+              // Textureless: UVs are 0 so every texel lands on shade 0,
+              // and fiw keeps the perspective divide in range.
+              ftu[fcount * 5 + i] = 0;
+              ftv[fcount * 5 + i] = 0;
+              fiw[fcount * 5 + i] = ToI64(GPU_PERSPECTIVE_SCALE / oz[i]);
+              depth += oz[i];
+            }
+            depth /= nv;
+            if (depth <= 40.0) {
+              xmin = xmax = fxs[fcount * 5];
+              ymin = ymax = fys[fcount * 5];
+              for (i = 1; i < nv; i++) {
+                sxx = fxs[fcount * 5 + i];
+                syy = fys[fcount * 5 + i];
+                if (sxx < xmin) xmin = sxx;
+                if (sxx > xmax) xmax = sxx;
+                if (syy < ymin) ymin = syy;
+                if (syy > ymax) ymax = syy;
+              }
+              if (xmax >= 0 && xmin < scr_w && ymax >= 0 && ymin < scr_h) {
+                fi = fcount;
+                fnverts[fi] = nv;
+                ca = GpuScale(GpuRgb(246, 248, 252), lightpct);
+                cb = GpuScale(GpuRgb(214, 224, 236), lightpct);
+                for (k = 0; k < 16; k++) face_cols[fi * 16 + k] = GpuMix(ca, cb, k * 16);
+                fcolA[fi] = ca;
+                fcolB[fi] = cb;
+                falpha[fi] = GPU_ALPHA_CLOUD;
+                fblk[fi] = B_AIR;
+                fdir[fi] = dir;
+                ffogT[fi] = 0;
+                fdepth[fi] = depth;
+                fcount++;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 U0 BuildFaceList()
 {
   I64 px, pz, x, z, y, ymax, b, dir, nb, i, buck, nx, ny, nz;
@@ -2678,6 +2995,7 @@ U0 BuildFaceList()
     }
   }
   // painter's algorithm: bucket sort far -> near
+  EmitClouds;
   invspan = 1.0 / (MC_FOG_END - MC_NEAR);
   for (i = 0; i < 256; i++) bhead[i] = -1;
   for (i = 0; i < fcount; i++) {
@@ -2697,35 +3015,137 @@ U0 DrawWorld()
 
 // =============================== SKY / HUD ===============================
 
+U0 DrawSkyBody(F64 dx, F64 dy, F64 dz, I64 radius, U32 core, U32 ring, I64 alpha){
+  // Project a celestial body direction and stamp a dithered disc.
+  F64 sx, sy, u, v, t, cz, px, py;
+  I64 x, y;
+  px = dx * cam_rx + dy * cam_ry + dz * cam_rz;
+  py = dx * cam_ux + dy * cam_uy + dz * cam_uz;
+  cz = dx * cam_fx + dy * cam_fy + dz * cam_fz;
+  if (cz < 0.1) return;
+  sx = scr_w * 0.5 + px * gpu_focal / cz;
+  sy = scr_h * 0.5 - py * gpu_focal / cz;
+  for (v = -radius - 3; v <= radius + 3; v++)
+    for (u = -radius - 3; u <= radius + 3; u++) {
+      x = ToI64(sx) + u;  y = ToI64(sy) + v;
+      if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
+        t = Sqrt(u * u + v * v);
+        if (t < radius) db[y * stride + x] = GpuMix(db[y * stride + x], core, alpha);
+        else if (t < radius + 2.5)
+          db[y * stride + x] = GpuMix(db[y * stride + x], ring, alpha >> 1);
+      }
+    }
+}
+
 U0 DrawSky()
 {
-  F64 sx, sy, u, v, t, cz;
-  I64 y, row, x, horizon, hw;
-  U32 c;
+  F64 sx, sy, u, v, t, cz, a, dx, dy, dz, px, py, fade;
+  I64 y, row, x, horizon, hw, i, lightv, starn, sx_i, sy_i;
+  U32 c, day, night;
   horizon = scr_h * 0.5 + Sin(P.pitch) / Cos(P.pitch) * gpu_focal;
   horizon = IClamp(horizon, -scr_h, 2 * scr_h);
+  lightv = ToI64(day_light * 255.0);
   for (y = 0; y < scr_h; y++) {
-    c = sky_row[y];
+    day = sky_row[y];
+    night = sky_row_n[y];
     // Haze peaks at the horizon and fades out over +/-6 rows instead of
     // being a hard band.
     hw = 255 - ToI64(FFabs(y - horizon) * 42.5);
+    c = GpuMix(night, day, lightv);
     if (hw > 0) c = GpuMix(c, haze_col, hw);
     MemSetU32(db + y * stride, c, scr_w);
   }
-  cz = 0.45 * cam_fx + 0.75 * cam_fy + 0.45 * cam_fz;
-  if (cz > 0.1) {
-    sx = scr_w * 0.5 + (0.45 * cam_rx + 0.75 * cam_ry + 0.45 * cam_rz) * gpu_focal / cz;
-    sy = scr_h * 0.5 - (0.45 * cam_ux + 0.75 * cam_uy + 0.45 * cam_uz) * gpu_focal / cz;
-    for (v = -16; v <= 16; v++)
-      for (u = -16; u <= 16; u++) {
-        x = sx + u;  y = sy + v;
-        if (x >= 0 && x < scr_w && y >= 0 && y < scr_h) {
-          t = Sqrt(u * u + v * v);
-          if (t < 10.0) db[y * stride + x] = GpuRgb(255, 238, 170);
-          else if (t < 14.0) db[y * stride + x] =
-            GpuMix(db[y * stride + x], GpuRgb(255, 238, 170), ToI64((14.0 - t) * 60));
+  // stars: hashed dome positions rotating with the sun arc, fading in as
+  // the light level drops
+  if (day_light < 0.55) {
+    starn = ToI64((0.55 - day_light) * 2.0 * 255.0);
+    a = day_time * 6.2832;
+    for (i = 0; i < 56; i++) {
+      dx = Cos(a + (Hash2i(i * 3 + 1, 7) & 1023) * 0.0061) * 0.85;
+      dy = Sin(a + (Hash2i(i * 5 + 2, 11) & 511) * 0.0061) * 0.9;
+      dz = 0.35 + (Hash2i(i * 7 + 3, 13) & 255) * 0.0012;
+      px = dx * cam_rx + dy * cam_ry + dz * cam_rz;
+      py = dx * cam_ux + dy * cam_uy + dz * cam_uz;
+      cz = dx * cam_fx + dy * cam_fy + dz * cam_fz;
+      if (cz >= 0.1) {
+        sx = scr_w * 0.5 + px * gpu_focal / cz;
+        sy = scr_h * 0.5 - py * gpu_focal / cz;
+        sx_i = ToI64(sx);  sy_i = ToI64(sy);
+        if (sx_i >= 0 && sx_i < scr_w && sy_i >= 0 && sy_i < scr_h)
+          db[sy_i * stride + sx_i] = GpuMix(db[sy_i * stride + sx_i],
+                                            GpuRgb(255, 255, 255), starn);
+      }
+    }
+  }
+  // fog follows the light level so night fog goes dark too
+  mcr_fog_col = GpuMix(GpuRgb(22, 30, 56), GpuRgb(169, 214, 242), lightv);
+  // sun and moon ride opposite ends of the same rotating arc: noon is
+  // day_time 0.25, midnight 0.75
+  a = day_time * 6.2832;
+  dx = Cos(a) * 0.85;
+  dy = Sin(a);
+  dz = 0.35;
+  fade = FClamp(dy * 4.0 + 0.5, 0.0, 1.0);
+  if (fade > 0.02)
+    DrawSkyBody(dx, dy, dz, 7, GpuRgb(255, 238, 170), GpuRgb(255, 214, 96),
+                ToI64(fade * 255.0));
+  fade = FClamp(-dy * 4.0 + 0.5, 0.0, 1.0);
+  if (fade > 0.02)
+    DrawSkyBody(-dx, -dy, -dz, 6, GpuRgb(228, 232, 240), GpuRgb(150, 158, 176),
+                ToI64(fade * 255.0));
+}
+
+U0 DrawCrackOverlay()
+{
+  // Darkening dither over the block being mined; the density grows with
+  // the progress so it reads as cracks spreading over the block.
+  // BLACK index 0 / RGB 0 both read as black, so this is backend-neutral.
+  F64 vx[8], vy[8], vz[8], cx, cy, cz, sxx[8], syy[8], frac, t, ya, yb, xa, xb, xl, xr;
+  I64 i, j, f, k, stage, x, y, x0, x1, y0, y1, row, c[4];
+  if (!mining || mine_progress <= 0.0) return;
+  frac = mine_progress / blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]];
+  frac = FClamp(frac, 0.0, 0.999);
+  stage = ToI64(frac * 8.0) + 1;
+  for (i = 0; i < 8; i++) {
+    vx[i] = mine_hx + corn_x[i] - cam_ex;
+    vy[i] = mine_hy + corn_y[i] - cam_ey;
+    vz[i] = mine_hz + corn_z[i] - cam_ez;
+    cz = vx[i] * cam_fx + vy[i] * cam_fy + vz[i] * cam_fz;
+    if (cz < MC_NEAR) return;           // only when fully visible
+    cx = vx[i] * cam_rx + vy[i] * cam_ry + vz[i] * cam_rz;
+    cy = vx[i] * cam_ux + vy[i] * cam_uy + vz[i] * cam_uz;
+    sxx[i] = scr_w * 0.5 + cx * gpu_focal / cz;
+    syy[i] = scr_h * 0.5 - cy * gpu_focal / cz;
+  }
+  for (f = 0; f < 6; f++) {
+    for (k = 0; k < 4; k++) c[k] = face_corners[f][k];
+    y0 = scr_h;  y1 = 0;
+    for (k = 0; k < 4; k++) {
+      if (ToI64(syy[c[k]]) < y0) y0 = ToI64(syy[c[k]]);
+      if (ToI64(syy[c[k]]) > y1) y1 = ToI64(syy[c[k]]);
+    }
+    y0 = IClamp(y0, 0, scr_h - 1);
+    y1 = IClamp(y1, 0, scr_h - 1);
+    for (y = y0; y <= y1; y++) {
+      xl = 1e9;  xr = -1e9;
+      for (j = 0; j < 4; j++) {
+        k = (j + 1) & 3;
+        ya = syy[c[j]];  yb = syy[c[k]];
+        if (ya != yb && ((y >= ya && y < yb) || (y >= yb && y < ya))) {
+          t = (y - ya) / (yb - ya);
+          xa = sxx[c[j]] + (sxx[c[k]] - sxx[c[j]]) * t;
+          if (xa < xl) xl = xa;
+          if (xa > xr) xr = xa;
         }
       }
+      if (xr >= xl) {
+        x0 = IClamp(ToI64(Ceil(xl)), 0, scr_w - 1);
+        x1 = IClamp(ToI64(Floor(xr)), 0, scr_w - 1);
+        row = y * stride;
+        for (x = x0; x <= x1; x++)
+          if (bayer[(x & 3) + ((y & 3) << 2)] < stage) db[row + x] = BLACK;
+      }
+    }
   }
 }
 
@@ -2828,12 +3248,44 @@ F64  last_dt;
 Bool prev_lb, prev_rb, prev_f;
 F64  last_mx, last_my;
 
+// Which item a broken block yields, Minecraft-style: grass drops dirt and
+// stone drops cobblestone; leaves and bedrock drop nothing.  -1 = no drop.
+I64 BlockDrop(I64 b)
+{
+  if (b == B_GRASS) return B_DIRT;
+  if (b == B_STONE) return B_COBBLE;
+  if (b == B_LEAVES) return -1;
+  if (b == B_BEDROCK) return -1;
+  return b;
+}
+
+U0 CollectDrop(I64 b)
+{
+  I64 i;
+  for (i = 0; i < 6; i++) {
+    if (hotbar_items[i] == b && hotbar_count[i] < 64) {
+      hotbar_count[i]++;
+      return;
+    }
+  }
+  for (i = 0; i < 6; i++) {
+    if (hotbar_count[i] == 0) {
+      hotbar_items[i] = b;
+      hotbar_count[i] = 1;
+      return;
+    }
+  }
+  // inventory full: the drop is lost
+}
+
 U0 BreakOrPlace(Bool place)
 {
-  I64 hitx, hity, hitz, hitface, tx, ty, tz, b;
+  I64 hitx, hity, hitz, hitface, tx, ty, tz, b, drop;
   if (!Raycast(&hitx, &hity, &hitz, &hitface))
     return;
   if (place) {
+    // need something in the selected slot
+    if (hotbar_count[hotbar_sel] <= 0) return;
     tx = hitx + (hitface == D_POSX) - (hitface == D_NEGX);
     ty = hity + (hitface == D_POSY) - (hitface == D_NEGY);
     tz = hitz + (hitface == D_POSZ) - (hitface == D_NEGZ);
@@ -2843,9 +3295,13 @@ U0 BreakOrPlace(Bool place)
     if (P.x + MC_HALF > tx && P.x - MC_HALF < tx + 1 && P.y + MC_HEIGHT > ty && P.y < ty + 1 && P.z + MC_HALF > tz && P.z - MC_HALF < tz + 1)
       return;
     SetBlockUpdate(tx, ty, tz, hotbar_items[hotbar_sel]);
+    hotbar_count[hotbar_sel]--;
   } else {
-    if (world[WIdx(hitx, hity, hitz)] == B_BEDROCK) return;
+    b = world[WIdx(hitx, hity, hitz)];
+    if (b == B_BEDROCK) return;
     SetBlockUpdate(hitx, hity, hitz, B_AIR);
+    drop = BlockDrop(b);
+    if (drop >= 0) CollectDrop(drop);
   }
 }
 
@@ -2874,7 +3330,31 @@ U0 HandleInput()
     P.flying = !P.flying;
   prev_f = Bt(kbd.down_bitmap, MC_SC_F);
   // mouse buttons
-  if (ms.lb && !prev_lb) BreakOrPlace(FALSE);
+  // Hold the left button to mine the targeted block; progress resets when
+  // the target changes or the button is released (Minecraft behaviour).
+  if (ms.lb) {
+    if (Raycast(&mine_hx, &mine_hy, &mine_hz, &mine_face)) {
+      if (!mining || mine_hx != last_hx || mine_hy != last_hy || mine_hz != last_hz) {
+        mining = TRUE;
+        mine_progress = 0.0;
+        last_hx = mine_hx;  last_hy = mine_hy;  last_hz = mine_hz;
+      }
+      if (blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]] >= 0.0) {
+        mine_progress += last_dt;
+        if (mine_progress >= blk_hard[world[WIdx(mine_hx, mine_hy, mine_hz)]]) {
+          mining = FALSE;
+          mine_progress = 0.0;
+          BreakOrPlace(FALSE);
+        }
+      }
+    } else {
+      mining = FALSE;
+      mine_progress = 0.0;
+    }
+  } else {
+    mining = FALSE;
+    mine_progress = 0.0;
+  }
   if (ms.rb && !prev_rb) BreakOrPlace(TRUE);
   prev_lb = ms.lb;
   prev_rb = ms.rb;
@@ -2885,11 +3365,7 @@ F64 NowSecs()
   return tS();
 }
 
-// Main-loop state, shared with GameFrame so the loop body can live in its
-// own function (hcc's transpiler cannot handle try/catch around the loop).
-Bool quit;
-I64 fps, frames;
-F64 t0, fps_t, phys_acc;
+// Main-loop state lives near the top of the file (used by EmitClouds).
 
 U0 GameFrame()
 {
@@ -2910,6 +3386,11 @@ U0 GameFrame()
     UpdatePlayer(MC_STEP_TIME);
     phys_acc -= MC_STEP_TIME;
   }
+  ProcessFalls;
+  // Day/night clock: 0 = dawn, 0.25 = noon, 0.5 = dusk, 0.75 = midnight.
+  day_time += dt / MC_DAY_LENGTH;
+  if (day_time >= 1.0) day_time -= 1.0;
+  day_light = FClamp(Sin(day_time * 6.2832) * 3.0 + 0.5, 0.0, 1.0);
   UpdateCamera;
   scr_w = gpu_w;
   scr_h = gpu_h;
@@ -2922,6 +3403,7 @@ U0 GameFrame()
     for (y = 0; y < scr_h; y++)
       for (x = 0; x < scr_w; x++)
             db[y * stride + x] = uwater_lut[ToI64(bayer[(x & 3) + ((y & 3) << 2)])];
+  DrawCrackOverlay;
   frames++;
   if (t1 - fps_t >= 1.0) {
     fps = frames / (t1 - fps_t);
@@ -2958,6 +3440,7 @@ U0 HolyCraft()
   scr_w = gpu_w;
   scr_h = gpu_h;
   t0 = NowSecs();  fps_t = t0;  phys_acc = 0.0;
+  day_time = 0.02;                       // just after dawn
   fps = 0;  frames = 0;  quit = FALSE;
   #ifdef __HCC__
   while (!quit) GameFrame;
