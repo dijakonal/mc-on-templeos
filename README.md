@@ -21,6 +21,7 @@ required. For the layered build, boot `TempleOS-HolyCraft-GPU.ISO` instead.
 | `TempleOS-HolyCraft-GPU.ISO` | Bootable CD with the graphical-layer build (VBE RGB or 16-color fallback) |
 | `TempleOS.ISO` | Pristine upstream TempleOS CD (rebuild input) |
 | `src/MCRAFT.HC` | Complete HolyC game source |
+| `src/JVM.HC`, `scripts/build_jvm_demo.py`, `src/java/` | HolyJVM: a Java bytecode interpreter for TempleOS + the javac demo build |
 | `src/MCRAFT_GPU.HC`, `scripts/make_gpu_source.py` | Generated layered source and its generator |
 | `scripts/gpu_hud.py` | HUD reader for the GPU build's inline 5x7 font |
 | `scripts/patch_iso.py` | Repacks the game into the ISO and patches the boot launcher |
@@ -83,6 +84,33 @@ cd ..
 The port renders and plays the full game (measured ~88 FPS under Xvfb). The
 underwater overlay, per-pixel fog and HUD text all go through the same code
 paths as the TempleOS builds.
+
+### HolyJVM: Java bytecode on TempleOS
+
+`src/JVM.HC` is a from-scratch JVM (class-file parser + bytecode
+interpreter) written in HolyC. It loads a real `javac`-compiled class
+(embedded as bytes by `scripts/build_jvm_demo.py`), executes the
+instruction set with an explicit call-frame stack, and supports int
+arithmetic, static fields, int/boolean arrays, recursive static calls and
+`Hos.print/println` builtins. The demo in `src/java/` computes Fibonacci,
+a prime sieve and a sum-of-squares with plain `javac --release 8`, and the
+results are verified on TempleOS:
+
+```
+HolyJVM v0.1: Java bytecode interpreter on TempleOS
+HolyJVM: class parsed
+4 methods parsed
+6106765
+168
+HolyJVM: run() returned 338350
+```
+
+To rebuild the demo class: edit `src/java/JvmDemo.java`, run
+`javac --release 8 src/java/JvmDemo.java src/java/Hos.java`, then
+`python3 scripts/build_jvm_demo.py` and rebuild the ISO. This proves Java
+bytecode runs on TempleOS; running *Minecraft* itself through it would
+additionally require the JDK class library, LWJGL's JNI natives and
+OpenGL — see the rendering discussion above.
 
 ## Controls
 
